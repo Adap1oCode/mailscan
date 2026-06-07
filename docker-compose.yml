@@ -6,8 +6,35 @@ services:
     environment:
       MAILSCAN_API_KEY: ${MAILSCAN_API_KEY}
       TESSERACT_CMD: /usr/bin/tesseract
+      REDIS_URL: redis://redis:6379/0
+      ADDRESS_PARSER: ${ADDRESS_PARSER:-regex}
       PORT: 8000
     volumes:
       # Live reload during local dev — NOT used in Coolify
       - ./app:/app/app
+    depends_on:
+      - redis
     restart: unless-stopped
+
+  worker:
+    build: .
+    command: celery -A app.worker worker --loglevel=info --concurrency=2
+    environment:
+      MAILSCAN_API_KEY: ${MAILSCAN_API_KEY}
+      TESSERACT_CMD: /usr/bin/tesseract
+      REDIS_URL: redis://redis:6379/0
+      ADDRESS_PARSER: ${ADDRESS_PARSER:-regex}
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3

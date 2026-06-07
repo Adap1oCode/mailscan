@@ -1,9 +1,12 @@
 """
 Mailscan microservice — FastAPI HTTP wrapper.
 Endpoints:
-  GET  /health   — liveness check, no auth
-  POST /process  — upload PDF, get structured results, requires X-API-Key
+  GET  /health         — liveness check, no auth
+  POST /process        — upload PDF, returns job_id (async)
+  GET  /jobs/{job_id}  — poll job status + result
+  POST /process/sync   — upload PDF, block until result (for simple callers)
 """
+import base64
 import os
 from typing import Any
 
@@ -14,7 +17,7 @@ from .pipeline import process_pdf
 
 app = FastAPI(
     title="Mailscan",
-    version="1.0.0",
+    version="2.0.0",
     description="PDF mail scan → OCR + barcode + client matching",
 )
 
@@ -29,28 +32,115 @@ def _require_api_key(key: str | None = Security(_api_key_header)) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+def _validate_upload(file: UploadFile, dpi: int) -> None:
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+    if dpi < 72 or dpi > 600:
+        raise HTTPException(status_code=400, detail="dpi must be between 72 and 600")
+
+
+def _get_celery() -> Any | None:
+    """Return Celery app if Redis is configured, otherwise None (sync fallback)."""
+    if not os.environ.get("REDIS_URL"):
+        return None
+    try:
+        from .worker import celery_app
+        return celery_app
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.post("/process")
-async def process(
+async def process_async(
     file: UploadFile = File(..., description="PDF file to process"),
     clients: str = Form(default="", description="Comma-separated client names for fuzzy matching"),
     dpi: int = Form(default=300, description="Render DPI — 300 optimal, lower is faster"),
     _: None = Security(_require_api_key),
 ) -> dict[str, Any]:
     """
-    Accept a scanned PDF, return per-page OCR text, postcode, barcode, and
-    optional fuzzy-matched client name.
+    Submit a PDF for processing. Returns a job_id to poll with GET /jobs/{job_id}.
+
+    If Redis is not configured (REDIS_URL not set), falls back to synchronous
+    processing and returns the result directly (same shape as GET /jobs/{job_id}
+    with status='complete').
     """
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+    _validate_upload(file, dpi)
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
-    if dpi < 72 or dpi > 600:
-        raise HTTPException(status_code=400, detail="dpi must be between 72 and 600")
+    client_list = [c.strip() for c in clients.split(",") if c.strip()] if clients else None
+    celery = _get_celery()
 
+    if celery is not None:
+        # Async path — submit to Celery
+        from .worker import process_pdf_task
+        pdf_b64 = base64.b64encode(pdf_bytes).decode()
+        task = process_pdf_task.delay(pdf_b64, client_list=client_list, dpi=dpi)
+        return {"job_id": task.id, "status": "pending"}
+
+    # Sync fallback — no Redis configured
+    try:
+        result = process_pdf(pdf_bytes, client_list=client_list, dpi=dpi)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return {"job_id": None, "status": "complete", "result": result}
+
+
+@app.get("/jobs/{job_id}")
+def job_status(
+    job_id: str,
+    _: None = Security(_require_api_key),
+) -> dict[str, Any]:
+    """
+    Poll job status and result.
+
+    Response:
+      { "job_id": str, "status": "pending"|"processing"|"complete"|"error", "result": dict|null }
+    """
+    celery = _get_celery()
+    if celery is None:
+        raise HTTPException(status_code=404, detail="Async jobs not available — REDIS_URL not configured")
+
+    from celery.result import AsyncResult
+    task = AsyncResult(job_id, app=celery)
+
+    state = task.state
+    if state == "PENDING":
+        return {"job_id": job_id, "status": "pending", "result": None}
+    if state == "STARTED" or state == "PROCESSING":
+        return {"job_id": job_id, "status": "processing", "result": None}
+    if state == "SUCCESS":
+        return {"job_id": job_id, "status": "complete", "result": task.result}
+    if state == "FAILURE":
+        return {"job_id": job_id, "status": "error", "result": None, "error": str(task.result)}
+
+    return {"job_id": job_id, "status": state.lower(), "result": None}
+
+
+@app.post("/process/sync")
+async def process_sync(
+    file: UploadFile = File(..., description="PDF file to process"),
+    clients: str = Form(default="", description="Comma-separated client names for fuzzy matching"),
+    dpi: int = Form(default=300, description="Render DPI — 300 optimal, lower is faster"),
+    _: None = Security(_require_api_key),
+) -> dict[str, Any]:
+    """
+    Synchronous endpoint — blocks until processing is complete and returns result directly.
+    Use for simple integrations (n8n, scripts) that don't want to poll.
+    May timeout on large PDFs — use POST /process + GET /jobs/{id} for production.
+    """
+    _validate_upload(file, dpi)
     pdf_bytes = await file.read()
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")

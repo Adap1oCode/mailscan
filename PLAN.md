@@ -205,11 +205,73 @@ Dashboard env var to add: `MAILSCAN_SERVICE_URL=http://mailscan:8000`
 - [ ] Processor registry (`lib/processors/registry.ts`)
 - [ ] End-to-end test: browser upload → dashboard route → mailscan service → results
 
-### Stage 5 — Coolify deployment ⬜
-- [ ] Push to dev, deploy via Coolify
-- [ ] Set env vars in Coolify
-- [ ] Smoke test live endpoint
+### Stage 5 — Coolify deployment ✅
+- [x] Push to dev, deploy via Coolify
+- [x] Set env vars in Coolify
+- [x] Smoke test live endpoint — 9/9 tests passed (see `TESTS.md`)
 - [ ] Wire n8n HTTP Request node to live URL
+
+---
+
+### Stage 6 — pylibdmtx from GitHub HEAD ✅
+Fixes known bugs in the PyPI release (v0.1.10, March 2022 — behind HEAD).
+
+- [ ] Update `requirements.txt` — install from GitHub source
+- [ ] Add `git` to Dockerfile apt packages (needed for pip git installs)
+- [ ] Redeploy and verify `/health` still returns ok
+
+### Stage 7 — OCRmyPDF hOCR integration ✅
+Replace raw Tesseract call with OCRmyPDF to get word-level bounding boxes.
+Enables address block localisation instead of full-page text search.
+No API contract change — same response shape, better accuracy.
+
+- [ ] Add `ocrmypdf` to `requirements.txt`
+- [ ] Add `ghostscript` to Dockerfile apt packages
+- [ ] Rewrite `_ocr()` in `pipeline.py` to use OCRmyPDF API mode + parse hOCR XML
+- [ ] Update `_extract_postcode()` to search address-region words first, full page as fallback
+- [ ] Update tests — verify postcode extraction still passes
+- [ ] Redeploy and smoke test
+
+### Stage 8 — libpostal noise-tolerant address parsing ✅
+Replaces postcode regex with an ML-based address parser trained on 1 billion addresses.
+Handles OCR noise: `LUT 1AA` → `LU1 1AA`, `LU11AA` (no space), `L U1 1AA` (extra space).
+Opt-in via `ADDRESS_PARSER=libpostal` env var — default stays regex (lightweight).
+
+- [ ] Add libpostal compile steps to Dockerfile (behind `ARG ENABLE_LIBPOSTAL=false` build arg)
+- [ ] Add `postal` to `requirements.txt` (conditional install)
+- [ ] Add `_extract_postcode_libpostal()` function to `pipeline.py`
+- [ ] Route `_extract_postcode()` based on `ADDRESS_PARSER` env var
+- [ ] Add `address_components` field to page result when libpostal is active (road, city, postcode)
+- [ ] Add `.env.example` entry for `ADDRESS_PARSER`
+- [ ] Update tests to cover both parser paths
+- [ ] Redeploy with `ADDRESS_PARSER=libpostal` and smoke test
+
+### Stage 9 — Async job queue (Celery + Redis) ✅
+Prevents HTTP timeouts on large PDFs or high volume. Breaking API change — do before Phase 2.
+`POST /process` → `{"job_id": "..."}` → `GET /jobs/{id}` → result when complete.
+
+- [ ] Add `celery[redis]` to `requirements.txt`
+- [ ] Add `app/worker.py` — Celery app + `process_pdf_task`
+- [ ] Update `main.py` — `POST /process` submits task, returns job_id
+- [ ] Add `GET /jobs/{job_id}` endpoint — returns status (`pending`|`processing`|`complete`|`error`) + result
+- [ ] Add Redis service to `docker-compose.yml` and `docker-compose.coolify.yml`
+- [ ] Add `REDIS_URL` to `.env.example` and `AGENTS.md` env var table
+- [ ] Update `TESTS.md` — new test cases for async flow
+- [ ] Update `README.md` — new API contract section
+- [ ] Redeploy and smoke test full async flow
+
+### Stage 10 — Consumer stamp barcode parser ⬜
+Post-2022 Royal Mail consumer stamps use a different 2D barcode format to Mailmark.
+Currently those decode as raw bytes with no field parsing.
+Gate: requires a real Royal Mail stamped envelope scan to test against.
+
+- [ ] Add `barcode_type` field to page result (`mailmark` | `stamp` | `unknown`)
+- [ ] Add `barcode_fields` object to page result (structured fields when format is known)
+- [ ] Add `_parse_mailmark()` function — parse Mailmark business mail barcode fields
+- [ ] Add `_parse_stamp_barcode()` function — parse post-2022 consumer stamp fields
+- [ ] Auto-detect format from decoded bytes and route to correct parser
+- [ ] Update tests with known barcode byte sequences
+- [ ] Document field layouts in `RESEARCH.md`
 
 ---
 

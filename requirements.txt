@@ -3,10 +3,12 @@ uvicorn[standard]
 python-multipart
 PyMuPDF
 pytesseract
-pylibdmtx
+git+https://github.com/NaturalHistoryMuseum/pylibdmtx.git
 rapidfuzz
 opencv-python-headless
 numpy
 Pillow
 tabulate
+ocrmypdf
+celery[redis]
 setuptools

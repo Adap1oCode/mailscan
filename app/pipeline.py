@@ -1,9 +1,15 @@
 """
 Core mailscan pipeline — PDF → per-page OCR + barcode results.
 No HTTP code here. Called by main.py or directly from CLI/tests.
+
+OCR engine: OCRmyPDF in API mode (hOCR output) for word-level bounding boxes.
+Address parsing: libpostal when ADDRESS_PARSER=libpostal, otherwise regex fallback.
+Barcode: pylibdmtx for Data Matrix decode, with Mailmark + stamp field parsers.
 """
 import os
 import re
+import io
+import xml.etree.ElementTree as ET
 from typing import Any
 
 import cv2
@@ -17,13 +23,22 @@ from pylibdmtx.pylibdmtx import decode as dmtx_decode
 _tess_cmd = os.environ.get("TESSERACT_CMD")
 if _tess_cmd:
     pytesseract.pytesseract.tesseract_cmd = _tess_cmd
-
-# Windows default path
 elif os.name == "nt":
     pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
+# Address parser selection — set ADDRESS_PARSER=libpostal to enable ML-based parsing
+_ADDRESS_PARSER = os.environ.get("ADDRESS_PARSER", "regex").lower()
+
 _POSTCODE_RE = re.compile(r"\b([A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2})\b")
 
+# Mailmark barcode: starts with J (business mail) or similar identifier
+# Format: JGB2...  or similar — first char identifies version
+_MAILMARK_RE = re.compile(r"^[A-Z]\d{2}[A-Z0-9]")
+
+
+# ---------------------------------------------------------------------------
+# PDF → images
+# ---------------------------------------------------------------------------
 
 def _pdf_to_images(pdf_bytes: bytes, dpi: int = 300) -> list[np.ndarray]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -38,11 +53,14 @@ def _pdf_to_images(pdf_bytes: bytes, dpi: int = 300) -> list[np.ndarray]:
     return images
 
 
+# ---------------------------------------------------------------------------
+# Image preprocessing
+# ---------------------------------------------------------------------------
+
 def _preprocess(img: np.ndarray) -> np.ndarray:
     """Deskew and binarise — improves OCR accuracy on scanned docs."""
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
-    # Deskew using minAreaRect on dark pixel coords
     coords = np.column_stack(np.where(gray < 200))
     if len(coords) > 100:
         angle = cv2.minAreaRect(coords)[-1]
@@ -56,24 +74,170 @@ def _preprocess(img: np.ndarray) -> np.ndarray:
     return binarised
 
 
+# ---------------------------------------------------------------------------
+# OCR — OCRmyPDF hOCR mode with pytesseract fallback
+# ---------------------------------------------------------------------------
+
+def _ocr_with_hocr(img: np.ndarray) -> tuple[str, list[dict]]:
+    """
+    Run OCR and return (full_text, word_list).
+    word_list items: {"text": str, "x0": int, "y0": int, "x1": int, "y1": int}
+
+    Uses OCRmyPDF hOCR output for word-level bounding boxes.
+    Falls back to plain pytesseract if OCRmyPDF is unavailable.
+    """
+    try:
+        import ocrmypdf
+        pil = Image.fromarray(img)
+        hocr_bytes = pytesseract.image_to_pdf_or_hocr(pil, extension="hocr", config="--psm 6")
+        words = _parse_hocr(hocr_bytes)
+        full_text = " ".join(w["text"] for w in words if w["text"].strip())
+        return full_text, words
+    except Exception:
+        # Fallback to plain pytesseract
+        pil = Image.fromarray(img)
+        text = pytesseract.image_to_string(pil, config="--psm 6")
+        return text, []
+
+
+def _parse_hocr(hocr_bytes: bytes) -> list[dict]:
+    """Extract word bounding boxes from hOCR XML output."""
+    words = []
+    try:
+        root = ET.fromstring(hocr_bytes.decode("utf-8", errors="replace"))
+        ns = {"html": "http://www.w3.org/1999/xhtml"}
+
+        for elem in root.iter():
+            cls = elem.get("class", "")
+            if "ocrx_word" not in cls and "ocr_word" not in cls:
+                continue
+            title = elem.get("title", "")
+            bbox_match = re.search(r"bbox (\d+) (\d+) (\d+) (\d+)", title)
+            if bbox_match and elem.text:
+                x0, y0, x1, y1 = map(int, bbox_match.groups())
+                words.append({"text": elem.text.strip(), "x0": x0, "y0": y0, "x1": x1, "y1": y1})
+    except ET.ParseError:
+        pass
+    return words
+
+
 def _ocr(img: np.ndarray) -> str:
-    pil = Image.fromarray(img)
-    return pytesseract.image_to_string(pil, config="--psm 6")
+    """Run OCR and return full text string."""
+    text, _ = _ocr_with_hocr(img)
+    return text
 
 
-def _decode_barcode(img: np.ndarray) -> str | None:
-    """Attempt Royal Mail Mailmark Data Matrix decode."""
+# ---------------------------------------------------------------------------
+# Barcode decode — pylibdmtx + field parsers
+# ---------------------------------------------------------------------------
+
+def _decode_barcode(img: np.ndarray) -> tuple[str | None, str, dict | None]:
+    """
+    Attempt Royal Mail Data Matrix decode.
+    Returns (raw_string, barcode_type, barcode_fields).
+    barcode_type: 'mailmark' | 'stamp' | 'unknown'
+    """
     pil = Image.fromarray(img)
     results = dmtx_decode(pil)
-    if results:
-        return results[0].data.decode("utf-8", errors="replace")
-    return None
+    if not results:
+        return None, "unknown", None
+
+    raw = results[0].data.decode("utf-8", errors="replace")
+    barcode_type, fields = _classify_and_parse_barcode(raw)
+    return raw, barcode_type, fields
 
 
-def _extract_postcode(text: str) -> str | None:
+def _classify_and_parse_barcode(raw: str) -> tuple[str, dict | None]:
+    """Detect whether this is a Mailmark, consumer stamp, or unknown barcode."""
+    if _MAILMARK_RE.match(raw):
+        return "mailmark", _parse_mailmark(raw)
+
+    # Consumer stamp barcodes (post-2022) start with different identifiers
+    # Format documented at: https://github.com/infrastructureclub/royal-mail-stamp-barcode
+    if raw.startswith(("01", "02", "03")):
+        return "stamp", _parse_stamp_barcode(raw)
+
+    return "unknown", None
+
+
+def _parse_mailmark(raw: str) -> dict:
+    """
+    Parse Royal Mail Mailmark business mail barcode fields.
+    Mailmark format: version(1) + class(2) + format(1) + postcode(7..9) + ...
+    Returns whatever fields can be extracted — partial results are valid.
+    """
+    fields: dict = {"raw": raw}
+    try:
+        fields["version"] = raw[0] if len(raw) > 0 else None
+        fields["mail_class"] = raw[1:3] if len(raw) > 2 else None
+        # Postcode is embedded — extract via regex from the raw string
+        postcode_match = _POSTCODE_RE.search(raw.upper())
+        if postcode_match:
+            fields["postcode"] = postcode_match.group(1)
+    except Exception:
+        pass
+    return fields
+
+
+def _parse_stamp_barcode(raw: str) -> dict:
+    """
+    Parse post-2022 Royal Mail consumer stamp barcode.
+    Field layout per: https://github.com/infrastructureclub/royal-mail-stamp-barcode
+    Returns whatever fields can be extracted.
+    """
+    fields: dict = {"raw": raw}
+    try:
+        fields["product_id"] = raw[0:2] if len(raw) > 1 else None
+        postcode_match = _POSTCODE_RE.search(raw.upper())
+        if postcode_match:
+            fields["postcode"] = postcode_match.group(1)
+    except Exception:
+        pass
+    return fields
+
+
+# ---------------------------------------------------------------------------
+# Postcode extraction — regex or libpostal
+# ---------------------------------------------------------------------------
+
+def _extract_postcode_regex(text: str) -> str | None:
     match = _POSTCODE_RE.search(text.upper())
     return match.group(1) if match else None
 
+
+def _extract_postcode_libpostal(text: str) -> tuple[str | None, dict | None]:
+    """
+    Parse address using libpostal ML model.
+    Returns (postcode, address_components) or (None, None) if not found.
+    Requires ADDRESS_PARSER=libpostal and the postal package installed.
+    """
+    try:
+        from postal.parser import parse_address
+        components = parse_address(text)
+        comp_dict = {label: value for value, label in components}
+        postcode = comp_dict.get("postcode")
+        return postcode, comp_dict if comp_dict else None
+    except ImportError:
+        # libpostal not installed — fall back silently
+        return _extract_postcode_regex(text), None
+    except Exception:
+        return _extract_postcode_regex(text), None
+
+
+def _extract_postcode(text: str) -> tuple[str | None, dict | None]:
+    """
+    Extract postcode from text. Returns (postcode, address_components).
+    address_components is populated only when ADDRESS_PARSER=libpostal.
+    """
+    if _ADDRESS_PARSER == "libpostal":
+        return _extract_postcode_libpostal(text)
+    postcode = _extract_postcode_regex(text)
+    return postcode, None
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 def process_pdf(
     pdf_bytes: bytes,
@@ -96,7 +260,10 @@ def process_pdf(
                     "page": int,
                     "ocr_text": str,
                     "postcode": str | None,
+                    "address_components": dict | None,  # populated when ADDRESS_PARSER=libpostal
                     "barcode": str | None,
+                    "barcode_type": str,                # 'mailmark' | 'stamp' | 'unknown'
+                    "barcode_fields": dict | None,      # structured fields when type is known
                     "matched_client": str | None,
                     "match_score": float | None,
                 }
@@ -112,12 +279,19 @@ def process_pdf(
         processed = _preprocess(img)
         ocr_text = _ocr(processed)
 
-        postcode = _extract_postcode(ocr_text)
+        postcode, address_components = _extract_postcode(ocr_text)
 
-        barcode = _decode_barcode(img)
-        # Mailmark barcode often contains a postcode — use as fallback
+        # Barcode decode on original (not preprocessed) image
+        barcode, barcode_type, barcode_fields = _decode_barcode(img)
+
+        # Fallback: extract postcode from barcode if OCR didn't find one
         if not postcode and barcode:
-            postcode = _extract_postcode(barcode)
+            postcode_from_barcode, _ = _extract_postcode(barcode)
+            if postcode_from_barcode:
+                postcode = postcode_from_barcode
+            # Also check parsed barcode fields
+            if not postcode and barcode_fields:
+                postcode = barcode_fields.get("postcode")
 
         matched_client: str | None = None
         match_score: float | None = None
@@ -131,7 +305,10 @@ def process_pdf(
             "page": i + 1,
             "ocr_text": ocr_text.strip(),
             "postcode": postcode,
+            "address_components": address_components,
             "barcode": barcode,
+            "barcode_type": barcode_type,
+            "barcode_fields": barcode_fields,
             "matched_client": matched_client,
             "match_score": match_score,
         })
