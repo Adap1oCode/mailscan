@@ -181,23 +181,23 @@ Dashboard env var to add: `MAILSCAN_SERVICE_URL=http://mailscan:8000`
 
 ## Build Stages
 
-### Stage 1 — Python service core ⬜
-- [ ] `app/__init__.py`
-- [ ] `app/pipeline.py` — PDF → images, preprocess, OCR, barcode, postcode extract, fuzzy match
-- [ ] `app/main.py` — FastAPI app with `/health` and `/process`
-- [ ] `requirements.txt`
-- [ ] `.env.example`
+### Stage 1 — Python service core ✅
+- [x] `app/__init__.py`
+- [x] `app/pipeline.py` — PDF → images, preprocess, OCR, barcode, postcode extract, fuzzy match
+- [x] `app/main.py` — FastAPI app with `/health` and `/process`
+- [x] `requirements.txt`
+- [x] `.env.example`
 - [ ] Manual smoke test: `curl -F file=@sample.pdf http://localhost:8000/process`
 
-### Stage 2 — Docker + local dev ⬜
-- [ ] `Dockerfile` — python:3.12-slim, install tesseract + libdmtx system deps
-- [ ] `docker-compose.yml` — local dev stack
+### Stage 2 — Docker + local dev ✅
+- [x] `Dockerfile` — python:3.12-slim, install tesseract + libdmtx system deps
+- [x] `docker-compose.yml` — local dev stack
 - [ ] Verify container builds and service starts
 - [ ] Smoke test against container
 
-### Stage 3 — Tests ⬜
-- [ ] `tests/test_pipeline.py` — unit test each pipeline function with a sample PDF
-- [ ] `tests/test_api.py` — HTTP integration tests (valid upload, bad key, non-PDF)
+### Stage 3 — Tests ✅
+- [x] `tests/test_pipeline.py` — unit test each pipeline function with a sample PDF
+- [x] `tests/test_api.py` — HTTP integration tests (valid upload, bad key, non-PDF)
 
 ### Stage 4 — Dashboard integration ⬜
 - [ ] `src/app/api/process/[processor]/route.ts` in luton-eng-dashboard

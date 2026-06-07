@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+PyMuPDF
+pytesseract
+pylibdmtx
+rapidfuzz
+opencv-python-headless
+numpy
+Pillow
+tabulate
+setuptools
