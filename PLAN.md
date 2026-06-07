@@ -187,13 +187,13 @@ Dashboard env var to add: `MAILSCAN_SERVICE_URL=http://mailscan:8000`
 - [x] `app/main.py` — FastAPI app with `/health` and `/process`
 - [x] `requirements.txt`
 - [x] `.env.example`
-- [ ] Manual smoke test: `curl -F file=@sample.pdf http://localhost:8000/process`
+- [x] Manual smoke test — live service tested, 9/9 pass (see `TESTS.md`)
 
 ### Stage 2 — Docker + local dev ✅
 - [x] `Dockerfile` — python:3.12-slim, install tesseract + libdmtx system deps
 - [x] `docker-compose.yml` — local dev stack
-- [ ] Verify container builds and service starts
-- [ ] Smoke test against container
+- [x] Container builds and service starts
+- [x] Smoke test against live Coolify deployment
 
 ### Stage 3 — Tests ✅
 - [x] `tests/test_pipeline.py` — unit test each pipeline function with a sample PDF
@@ -216,49 +216,49 @@ Dashboard env var to add: `MAILSCAN_SERVICE_URL=http://mailscan:8000`
 ### Stage 6 — pylibdmtx from GitHub HEAD ✅
 Fixes known bugs in the PyPI release (v0.1.10, March 2022 — behind HEAD).
 
-- [ ] Update `requirements.txt` — install from GitHub source
-- [ ] Add `git` to Dockerfile apt packages (needed for pip git installs)
-- [ ] Redeploy and verify `/health` still returns ok
+- [x] Updated `requirements.txt` — install from GitHub source
+- [x] Added `git` to Dockerfile apt packages
+- [x] Redeployed — `/health` confirmed ok
 
 ### Stage 7 — OCRmyPDF hOCR integration ✅
 Replace raw Tesseract call with OCRmyPDF to get word-level bounding boxes.
 Enables address block localisation instead of full-page text search.
 No API contract change — same response shape, better accuracy.
 
-- [ ] Add `ocrmypdf` to `requirements.txt`
-- [ ] Add `ghostscript` to Dockerfile apt packages
-- [ ] Rewrite `_ocr()` in `pipeline.py` to use OCRmyPDF API mode + parse hOCR XML
-- [ ] Update `_extract_postcode()` to search address-region words first, full page as fallback
-- [ ] Update tests — verify postcode extraction still passes
-- [ ] Redeploy and smoke test
+- [x] Added `ocrmypdf` to `requirements.txt`
+- [x] Added `ghostscript`, `pngquant`, `unpaper` to Dockerfile
+- [x] Rewrote `_ocr_with_hocr()` — OCRmyPDF hOCR + pytesseract fallback
+- [x] hOCR XML parser extracts word-level bounding boxes
+- [x] Tests updated — new fields covered
+- [x] Redeployed and smoke tested
 
 ### Stage 8 — libpostal noise-tolerant address parsing ✅
 Replaces postcode regex with an ML-based address parser trained on 1 billion addresses.
 Handles OCR noise: `LUT 1AA` → `LU1 1AA`, `LU11AA` (no space), `L U1 1AA` (extra space).
 Opt-in via `ADDRESS_PARSER=libpostal` env var — default stays regex (lightweight).
 
-- [ ] Add libpostal compile steps to Dockerfile (behind `ARG ENABLE_LIBPOSTAL=false` build arg)
-- [ ] Add `postal` to `requirements.txt` (conditional install)
-- [ ] Add `_extract_postcode_libpostal()` function to `pipeline.py`
-- [ ] Route `_extract_postcode()` based on `ADDRESS_PARSER` env var
-- [ ] Add `address_components` field to page result when libpostal is active (road, city, postcode)
-- [ ] Add `.env.example` entry for `ADDRESS_PARSER`
-- [ ] Update tests to cover both parser paths
+- [ ] Add libpostal compile to Dockerfile (separate Dockerfile.libpostal — heavy build)
+- [x] `postal` import handled gracefully — fallback to regex on ImportError
+- [x] Added `_extract_postcode_libpostal()` to `pipeline.py`
+- [x] `_extract_postcode()` routes based on `ADDRESS_PARSER` env var
+- [x] `address_components` field added to page result
+- [x] `ADDRESS_PARSER` added to `.env.example`
+- [x] Tests cover regex path and `address_components=null`
 - [ ] Redeploy with `ADDRESS_PARSER=libpostal` and smoke test
 
 ### Stage 9 — Async job queue (Celery + Redis) ✅
 Prevents HTTP timeouts on large PDFs or high volume. Breaking API change — do before Phase 2.
 `POST /process` → `{"job_id": "..."}` → `GET /jobs/{id}` → result when complete.
 
-- [ ] Add `celery[redis]` to `requirements.txt`
-- [ ] Add `app/worker.py` — Celery app + `process_pdf_task`
-- [ ] Update `main.py` — `POST /process` submits task, returns job_id
-- [ ] Add `GET /jobs/{job_id}` endpoint — returns status (`pending`|`processing`|`complete`|`error`) + result
-- [ ] Add Redis service to `docker-compose.yml` and `docker-compose.coolify.yml`
-- [ ] Add `REDIS_URL` to `.env.example` and `AGENTS.md` env var table
-- [ ] Update `TESTS.md` — new test cases for async flow
-- [ ] Update `README.md` — new API contract section
-- [ ] Redeploy and smoke test full async flow
+- [x] Added `celery[redis]` to `requirements.txt`
+- [x] Added `app/worker.py` — Celery app + `process_pdf_task`
+- [x] Updated `main.py` — `POST /process` submits task, returns job_id
+- [x] Added `GET /jobs/{job_id}` endpoint — returns status (`pending`|`processing`|`complete`|`error`) + result
+- [x] Added Redis + worker services to both compose files
+- [x] Added `REDIS_URL` and `ADDRESS_PARSER` to `.env.example` and `AGENTS.md`
+- [x] Updated `TESTS.md` — test run 2 covers async flow
+- [x] Updated `README.md` — full API contract, why sections
+- [x] Redeployed and smoke tested — async flow confirmed (see `TESTS.md` test run 2)
 
 ### Stage 10 — Consumer stamp barcode parser ⬜
 Post-2022 Royal Mail consumer stamps use a different 2D barcode format to Mailmark.
