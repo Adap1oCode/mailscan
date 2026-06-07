@@ -2,12 +2,9 @@ services:
   mailscan:
     build: .
     ports:
-      - "8000:8000"
+      - "${PORT:-8000}:${PORT:-8000}"
     environment:
       MAILSCAN_API_KEY: ${MAILSCAN_API_KEY}
       TESSERACT_CMD: /usr/bin/tesseract
-      PORT: 8000
-    volumes:
-      # Live reload during local dev — NOT used in Coolify
-      - ./app:/app/app
+      PORT: ${PORT:-8000}
     restart: unless-stopped

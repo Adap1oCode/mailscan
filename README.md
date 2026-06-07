@@ -341,37 +341,65 @@ Remove the volume mount for production Coolify deployments.
 
 ## Deployment — Coolify
 
-This service is deployed via Coolify as a Docker container.
+This service is deployed via Coolify as a Docker Compose application.
 
 **Branches → environments:**
 
 | Branch | Environment |
 |--------|-------------|
-| `dev` | Development |
+| `dev` | Development / staging |
 | `main` | Production |
 
-**Coolify build command:** *(leave default — uses Dockerfile)*
+---
 
-**Coolify start command:**
-```bash
-sh -c "uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"
-```
+### Step-by-step Coolify setup
 
-**Required Coolify env vars:**
+**1. Create a new resource**
+- Coolify → New Resource → Docker Compose
+- Connect to GitHub repo: `Adap1oCode/mailscan`
+- Select branch: `dev` (or `main` for production)
+
+**2. Set the Compose file**
+- Compose file path: `docker-compose.coolify.yml`
+  *(Do NOT use `docker-compose.yml` — that one has the dev volume mount)*
+
+**3. Set the domain**
+- Attach your domain e.g. `mailscan-dev.adaplo.io`
+- Enable HTTPS / Let's Encrypt
+
+**4. Set environment variables**
+
 | Variable | Value |
 |----------|-------|
-| `MAILSCAN_API_KEY` | Generate with `openssl rand -hex 32` |
-| `TESSERACT_CMD` | `/usr/bin/tesseract` (already set in Dockerfile — override if needed) |
+| `MAILSCAN_API_KEY` | Generate: `openssl rand -hex 32` |
+| `TESSERACT_CMD` | `/usr/bin/tesseract` |
 | `PORT` | `8000` |
 
-**Internal service URL** (for dashboard or n8n on same Docker network):
+**5. Deploy**
+- Click Deploy
+- Watch build logs — pip install takes ~2 minutes on first build (heavy deps)
+- Healthcheck at `/health` confirms service is up
+
+**6. Smoke test after deploy**
+```bash
+curl https://mailscan-dev.adaplo.io/health
+# → {"status":"ok"}
+
+curl -X POST https://mailscan-dev.adaplo.io/process \
+  -H "X-API-Key: <your-key>" \
+  -F "file=@scan.pdf"
+```
+
+---
+
+**Internal service URL** (for other containers on the same Coolify network):
 ```
 http://mailscan:8000
 ```
 
-**Public URL** (if exposed via Coolify):
+**Public URL:**
 ```
-https://mailscan.adaplo.io
+https://mailscan-dev.adaplo.io
 ```
 
 ---
