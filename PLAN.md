@@ -213,8 +213,274 @@ Dashboard env var to add: `MAILSCAN_SERVICE_URL=http://mailscan:8000`
 
 ---
 
-## Key Rules
-- `pipeline.py` has no HTTP code — pure processing logic, independently testable
-- `main.py` has no processing logic — pure HTTP wrapper
-- API key checked on every `/process` call — `/health` is open
-- Always work on `dev` branch — never push to `main`
+---
+
+# Phase 2 — Mailscan Dashboard
+
+## What We're Building
+
+A standalone web application that sits in front of the Phase 1 microservice.
+Users log in, upload scans via a browser UI, view results, manage their API keys,
+and connect Mailscan to external systems (n8n, Zapier, custom webhooks).
+
+The Phase 1 microservice is unchanged — Phase 2 is a product layer on top of it.
+
+---
+
+## Phase 2 Architecture
+
+```
+Browser (Next.js dashboard)
+        │
+        │  Supabase Auth (login / session)
+        │
+        ├─── Upload UI  ──────────────────────────────────────────┐
+        │                                                          │
+        │  POST /api/process (Next.js route)                       │
+        │  ↓ forwards to mailscan service                          │
+        │  ↓ stores results in Supabase                            │
+        │                                                          │
+        ├─── Results UI (scan history, per-page detail)            │
+        │                                                          │
+        ├─── API Keys UI (create / revoke / copy)                  │
+        │                                                          │
+        └─── Webhooks UI (configure outbound notifications)        │
+                                                                   │
+Supabase (Postgres + Auth + Storage)                               │
+  ├── users / orgs                                                  │
+  ├── api_keys                                                      │
+  ├── scans (job + result store)                                    │
+  └── webhooks                                                      │
+                                                                   │
+Phase 1 microservice (unchanged)  ◄────────────────────────────────┘
+```
+
+---
+
+## Phase 2 Tech Stack
+
+| Component | Choice | Reason |
+|-----------|--------|--------|
+| Framework | Next.js 15 (App Router) | Same stack as luton-eng-dashboard — reuse patterns |
+| Auth | Supabase Auth | Email/password + magic link; multi-tenant via org model |
+| Database | Supabase (Postgres) | Scan history, API keys, webhooks, users |
+| File storage | Supabase Storage | Original PDF uploads retained per scan |
+| UI | Tailwind CSS + shadcn/ui | Rapid build, consistent with existing projects |
+| Deployment | Coolify (Docker) | Same infra as Phase 1 |
+
+---
+
+## Data Model
+
+### `orgs`
+| Column | Type | Notes |
+|--------|------|-------|
+| id | uuid PK | |
+| name | text | Organisation name |
+| slug | text | URL-safe identifier |
+| created_at | timestamptz | |
+
+### `org_members`
+| Column | Type | Notes |
+|--------|------|-------|
+| id | uuid PK | |
+| org_id | uuid FK → orgs | |
+| user_id | uuid FK → auth.users | |
+| role | text | `owner` \| `admin` \| `member` |
+| created_at | timestamptz | |
+
+### `api_keys`
+| Column | Type | Notes |
+|--------|------|-------|
+| id | uuid PK | |
+| org_id | uuid FK → orgs | |
+| name | text | Human label e.g. "n8n production" |
+| key_hash | text | SHA-256 of the key — never store plaintext |
+| key_prefix | text | First 8 chars for display e.g. `ms_abc123` |
+| created_by | uuid FK → auth.users | |
+| last_used_at | timestamptz | Updated on each successful request |
+| revoked_at | timestamptz | Null = active |
+| created_at | timestamptz | |
+
+> Keys are shown in full exactly once (on creation). After that only the prefix is shown.
+
+### `scans`
+| Column | Type | Notes |
+|--------|------|-------|
+| id | uuid PK | |
+| org_id | uuid FK → orgs | |
+| created_by | uuid FK → auth.users \| null | Null = API call |
+| api_key_id | uuid FK → api_keys \| null | Set when submitted via API key |
+| filename | text | Original filename |
+| storage_path | text | Supabase Storage path to the PDF |
+| page_count | int | |
+| status | text | `pending` \| `processing` \| `complete` \| `error` |
+| error_message | text \| null | Set on failure |
+| result | jsonb | Full `/process` response stored here |
+| clients_used | text[] | Client list passed with this scan |
+| created_at | timestamptz | |
+| completed_at | timestamptz \| null | |
+
+### `webhooks`
+| Column | Type | Notes |
+|--------|------|-------|
+| id | uuid PK | |
+| org_id | uuid FK → orgs | |
+| name | text | Human label |
+| url | text | Target endpoint |
+| secret | text | Signing secret (HMAC-SHA256) — stored encrypted |
+| events | text[] | e.g. `["scan.complete", "scan.error"]` |
+| enabled | bool | |
+| created_at | timestamptz | |
+
+---
+
+## Phase 2 Routes
+
+### Dashboard UI
+| Route | Description |
+|-------|-------------|
+| `/login` | Supabase Auth login (email + password, magic link) |
+| `/` | Redirect → `/scans` |
+| `/scans` | Scan history — table with status, filename, date, postcode summary |
+| `/scans/[id]` | Scan detail — per-page results, OCR text, matched client, postcode |
+| `/upload` | Upload form — drag and drop PDF, optional client list |
+| `/api-keys` | List active keys, create new, revoke |
+| `/webhooks` | List webhooks, create, edit, delete |
+| `/settings` | Org name, members, billing (future) |
+
+### API Routes (Next.js)
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/api/process` | API key or session | Upload PDF → mailscan service → store result |
+| GET | `/api/scans` | Session | List scans for org |
+| GET | `/api/scans/[id]` | Session | Get single scan result |
+| POST | `/api/api-keys` | Session | Create new API key |
+| DELETE | `/api/api-keys/[id]` | Session | Revoke API key |
+| GET | `/api/api-keys` | Session | List keys (prefix + metadata only) |
+| POST | `/api/webhooks` | Session | Create webhook |
+| PUT | `/api/webhooks/[id]` | Session | Update webhook |
+| DELETE | `/api/webhooks/[id]` | Session | Delete webhook |
+
+---
+
+## API Key System
+
+Keys are prefixed `ms_` and generated with 32 bytes of random data:
+
+```
+ms_<base62(32 random bytes)>
+```
+
+Flow:
+1. User clicks "Create API Key", gives it a name
+2. Server generates key, stores SHA-256 hash + prefix in `api_keys`
+3. Full key shown once in UI — user copies it
+4. On subsequent API calls: key is hashed, looked up in `api_keys`, org resolved
+5. `last_used_at` updated on every successful call
+6. Revoke = set `revoked_at` timestamp
+
+---
+
+## Webhook System
+
+On `scan.complete` or `scan.error`, the dashboard fires an outbound HTTP POST
+to each enabled webhook URL configured for the org.
+
+Payload:
+```json
+{
+  "event": "scan.complete",
+  "scan_id": "uuid",
+  "filename": "letters.pdf",
+  "page_count": 3,
+  "pages": [ ... ],
+  "created_at": "2026-06-07T12:00:00Z"
+}
+```
+
+Each request includes `X-Mailscan-Signature: sha256=<hmac>` for verification.
+Delivery is fire-and-forget (background job) — failures are logged, not retried in Phase 2.
+
+---
+
+## Phase 2 Build Stages
+
+### Stage 2.1 — Supabase schema + auth ⬜
+- [ ] Create Supabase project (or reuse existing for the org)
+- [ ] Write migrations: `orgs`, `org_members`, `api_keys`, `scans`, `webhooks`
+- [ ] RLS policies: org isolation — users only see their own org's data
+- [ ] Configure Supabase Auth: email/password + magic link
+- [ ] `.env.example` updated with Supabase vars
+
+### Stage 2.2 — Next.js app scaffold ⬜
+- [ ] New repo or subdirectory: `mailscan-dashboard/`
+- [ ] Next.js 15 App Router + TypeScript + Tailwind + shadcn/ui
+- [ ] Supabase SSR client (`@supabase/ssr`)
+- [ ] Auth middleware — redirect unauthenticated users to `/login`
+- [ ] Login page (`/login`) — email/password + magic link
+- [ ] Basic layout: sidebar nav + header
+- [ ] Deploy skeleton to Coolify (`https://mailscan.adaplo.io` or equivalent)
+
+### Stage 2.3 — Upload + process flow ⬜
+- [ ] `/upload` page — drag-and-drop PDF, optional client list input
+- [ ] `POST /api/process` route — accept file, forward to Phase 1 service, store result in `scans`
+- [ ] Upload to Supabase Storage (original PDF retained)
+- [ ] Status polling or optimistic redirect to scan detail on completion
+- [ ] `/scans/[id]` — per-page results table: page number, postcode, barcode, matched client, OCR text (expandable)
+
+### Stage 2.4 — Scan history ⬜
+- [ ] `/scans` — paginated table: filename, date, page count, status, postcode summary
+- [ ] Filter by date range, status
+- [ ] Link to scan detail
+- [ ] Export results as CSV
+
+### Stage 2.5 — API key management ⬜
+- [ ] `/api-keys` page — list active keys (prefix, name, created, last used)
+- [ ] Create key flow — name input → generate → show full key once → copy button
+- [ ] Revoke key — confirmation dialog → sets `revoked_at`
+- [ ] `POST /api/api-keys` and `DELETE /api/api-keys/[id]` routes
+- [ ] API key auth middleware for `POST /api/process` — allows machine-to-machine calls
+
+### Stage 2.6 — Webhook management ⬜
+- [ ] `/webhooks` page — list configured webhooks
+- [ ] Create/edit webhook — URL, name, events, enable/disable
+- [ ] Webhook delivery on `scan.complete` / `scan.error` (background, fire-and-forget)
+- [ ] HMAC-SHA256 signing of outbound payloads
+- [ ] Delivery log per webhook (last N attempts, status code)
+
+### Stage 2.7 — Multi-org + settings ⬜
+- [ ] `/settings` — org name, member list, invite by email
+- [ ] Invite flow — email → Supabase invite → lands in org on first login
+- [ ] Role enforcement: `owner` can manage members + billing, `member` can upload only
+- [ ] Org switcher in header (for users in multiple orgs)
+
+### Stage 2.8 — Hardening + deployment ⬜
+- [ ] Rate limiting on `/api/process` per API key (e.g. 100 req/day free tier)
+- [ ] Input validation on all routes
+- [ ] Error states and empty states on all pages
+- [ ] Coolify production deployment with env vars
+- [ ] Smoke test: login → upload → view result → copy API key → call via curl → webhook fires
+
+---
+
+## Phase 2 Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `NEXT_PUBLIC_SUPABASE_URL` | Yes | Supabase project URL |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Yes | Supabase anon key |
+| `SUPABASE_SERVICE_ROLE_KEY` | Yes | Server-only — for admin operations |
+| `MAILSCAN_SERVICE_URL` | Yes | Phase 1 service URL e.g. `http://mailscan:8000` |
+| `MAILSCAN_API_KEY` | Yes | Key to authenticate with Phase 1 service |
+| `NEXT_PUBLIC_SITE_URL` | Yes | Canonical URL for auth redirects |
+| `WEBHOOK_SIGNING_SECRET` | Yes | Master secret for HMAC webhook signatures |
+
+---
+
+## Key Rules (Phase 2)
+- Phase 1 microservice is NEVER modified as part of Phase 2 work
+- All database access goes through `lib/db/` — never raw SQL in route handlers
+- API keys are NEVER stored in plaintext — SHA-256 hash only
+- Org isolation is enforced at the RLS layer in Supabase — not just in application code
+- Always work on `dev` branch — Waseem merges to `main`
