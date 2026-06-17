@@ -194,6 +194,17 @@ def _decode_barcode(img: np.ndarray) -> tuple[str | None, str, dict | None]:
     return raw, barcode_type, fields
 
 
+def _significant_name(name: str) -> str:
+    """
+    Drop initials / short tokens so client matching keys on the distinctive
+    parts of a name (e.g. 'T M Choudhary' -> 'Choudhary'). Matching the full name
+    against a whole page lets single letters ('T', 'M') and common words ('Ltd')
+    in the body text produce false matches; significant tokens avoid that.
+    """
+    tokens = [t for t in re.split(r"\s+", name.replace(".", " ")) if len(t) >= 3]
+    return " ".join(tokens) if tokens else name
+
+
 def _normalise_postcode(pc: str) -> str:
     """Re-insert the space in a packed postcode: 'LU48DP' -> 'LU4 8DP'."""
     pc = pc.replace(" ", "").upper()
@@ -332,7 +343,7 @@ def process_pdf(
             ]
         }
     """
-    from rapidfuzz import fuzz, process as fuzz_process
+    from rapidfuzz import fuzz
 
     pages = []
 
@@ -358,15 +369,18 @@ def process_pdf(
         matched_client: str | None = None
         match_score: float | None = None
         if client_list:
-            result = fuzz_process.extractOne(
-                ocr_text,
-                client_list,
-                scorer=fuzz.partial_token_set_ratio,
-                score_cutoff=_MATCH_CUTOFF,
-            )
-            if result:
-                matched_client, match_score, _ = result
-                match_score = round(match_score, 1)
+            text_upper = ocr_text.upper()
+            best_client: str | None = None
+            best_score = 0.0
+            for client in client_list:
+                # partial_ratio finds the name as a substring anywhere in the
+                # page; significant tokens keep it from matching on initials.
+                score = fuzz.partial_ratio(_significant_name(client).upper(), text_upper)
+                if score > best_score:
+                    best_score, best_client = score, client
+            if best_score >= _MATCH_CUTOFF:
+                matched_client = best_client
+                match_score = round(best_score, 1)
 
         pages.append({
             "page": i + 1,
