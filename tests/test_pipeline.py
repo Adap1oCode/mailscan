@@ -54,8 +54,10 @@ def test_no_postcode_returns_none():
 def test_client_fuzzy_match():
     from app.pipeline import process_pdf
 
+    # Matching is scoped to the recipient address block, so the addressee must
+    # appear in an address block (name + lines + postcode), as on a real letter.
     result = process_pdf(
-        _make_pdf("Dear Acme Industries Ltd\nPlease find enclosed..."),
+        _make_pdf("Acme Industries Ltd\n14 High Street\nLuton LU1 1AA\n\nDear Sir, Please find enclosed..."),
         client_list=["Acme Industries Ltd", "Beta Corp", "Gamma LLC"],
     )
     page = result["pages"][0]
@@ -131,13 +133,18 @@ def test_assess_auto_on_individual_mailmark_postcode():
     assert _assess_confidence(page, None)["decision"] == "auto"
 
 
-def test_assess_shared_office_needs_recipient():
+def test_assess_shared_office_requires_client_match():
     from app.pipeline import _assess_confidence
-    base = {"barcode_type": "mailmark", "postcode": "LU1 2DW", "ocr_text": "x" * 300, "match_score": None}
-    no_name = _assess_confidence({**base, "recipient_name": None, "recipient_confidence": 0.0}, None)
-    assert no_name["decision"] == "ai"  # shared postcode, no name → AI
-    with_name = _assess_confidence({**base, "recipient_name": "Acme Ltd", "recipient_confidence": 0.85}, None)
-    assert with_name["decision"] == "auto"
+    base = {"barcode_type": "mailmark", "postcode": "LU1 2DW", "ocr_text": "x" * 300}
+    # shared postcode, no recipient at all → AI to extract one
+    no_name = _assess_confidence({**base, "recipient_name": None, "recipient_confidence": 0.0, "match_score": None}, None)
+    assert no_name["decision"] == "ai"
+    # shared postcode, recipient extracted but NOT matched to a client → review
+    name_no_match = _assess_confidence({**base, "recipient_name": "Acme Ltd", "recipient_confidence": 0.85, "match_score": None}, None)
+    assert name_no_match["decision"] == "review"
+    # shared postcode + strong client match → auto
+    matched = _assess_confidence({**base, "recipient_name": "Acme Ltd", "recipient_confidence": 0.85, "matched_client": "Acme Ltd", "match_score": 100.0}, 100.0)
+    assert matched["decision"] == "auto"
 
 
 def test_assess_review_on_blank_page():

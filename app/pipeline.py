@@ -143,24 +143,23 @@ def _preprocess(img: np.ndarray) -> np.ndarray:
 
 def _ocr_with_hocr(img: np.ndarray) -> tuple[str, list[dict]]:
     """
-    Run OCR and return (full_text, word_list).
+    Run OCR and return (full_text, word_list) with word-level bounding boxes.
     word_list items: {"text": str, "x0": int, "y0": int, "x1": int, "y1": int}
 
-    Uses OCRmyPDF hOCR output for word-level bounding boxes.
-    Falls back to plain pytesseract if OCRmyPDF is unavailable.
+    Uses pytesseract's hOCR output (image_to_pdf_or_hocr) for the boxes — this only
+    needs the Tesseract binary, NOT ocrmypdf. Falls back to plain image_to_string
+    only if hOCR parsing yields nothing.
     """
+    pil = Image.fromarray(img)
     try:
-        import ocrmypdf
-        pil = Image.fromarray(img)
         hocr_bytes = pytesseract.image_to_pdf_or_hocr(pil, extension="hocr", config="--psm 6")
         words = _parse_hocr(hocr_bytes)
-        full_text = " ".join(w["text"] for w in words if w["text"].strip())
-        return full_text, words
+        if words:
+            full_text = " ".join(w["text"] for w in words if w["text"].strip())
+            return full_text, words
     except Exception:
-        # Fallback to plain pytesseract
-        pil = Image.fromarray(img)
-        text = pytesseract.image_to_string(pil, config="--psm 6")
-        return text, []
+        pass
+    return pytesseract.image_to_string(pil, config="--psm 6"), []
 
 
 def _parse_hocr(hocr_bytes: bytes) -> list[dict]:
@@ -313,23 +312,21 @@ def _assess_confidence(page: dict, match_margin: float | None) -> dict:
 
     if mm and pc:
         reasons.append(f"Mailmark barcode → delivery postcode {pc} (deterministic)")
-        if not shared:
-            reasons.append("Individual postcode routes directly")
-            return {"decision": "auto", "confidence": 95, "reasons": reasons}
-        reasons.append("Shared-office postcode → recipient name required to route")
-        if strong_match:
-            reasons.append(f"Strong client match: {page.get('matched_client')} ({score})")
-            return {"decision": "auto", "confidence": 90, "reasons": reasons}
-        if good_name:
-            reasons.append(f"Recipient name extracted: {name!r}")
-            return {"decision": "auto", "confidence": 80, "reasons": reasons}
-        reasons.append("No confident recipient name or client match → AI")
-        return {"decision": "ai", "confidence": 50, "reasons": reasons}
-
-    reasons.append("No Mailmark barcode")
-    if good_name and strong_match:
-        reasons.append("Recipient name + client match without barcode")
-        return {"decision": "auto", "confidence": 75, "reasons": reasons}
+    # AUTO requires confident routing: a client match, or an individual
+    # (non-shared) delivery postcode. Extracting a recipient name is NOT enough
+    # on its own — we must map it to a client or the routing is a guess.
+    if strong_match:
+        reasons.append(f"Matched client: {page.get('matched_client')} ({score})")
+        return {"decision": "auto", "confidence": 95 if mm else 85, "reasons": reasons}
+    if mm and pc and not shared:
+        reasons.append("Individual delivery postcode routes directly")
+        return {"decision": "auto", "confidence": 90, "reasons": reasons}
+    if mm and pc and shared:
+        reasons.append("Shared-office postcode → a client match is required to route")
+    # We could not confidently map to a client.
+    if good_name:
+        reasons.append(f"Recipient '{name}' extracted but no client match → human review")
+        return {"decision": "review", "confidence": 55, "reasons": reasons}
     if text_len > 200:
         reasons.append("Readable text but no confident recipient → AI extraction")
         return {"decision": "ai", "confidence": 40, "reasons": reasons}
@@ -532,20 +529,24 @@ def process_pdf(
         # reliable than a regex over a dense page. Prefer it; OCR is the fallback.
         postcode = barcode_postcode or ocr_postcode
 
-        # Recipient name from the address block (uses hOCR word positions).
-        recipient_name, recipient_conf, _block = _extract_recipient(
+        # Recipient name + address block (uses hOCR word positions).
+        recipient_name, recipient_conf, recipient_block = _extract_recipient(
             _group_lines(words), processed.shape[0], postcode
         )
 
-        # Client match with a best-vs-second margin (ambiguity check).
+        # Client match — scoped to the recipient ADDRESS BLOCK, not the whole page.
+        # Matching the full page false-positives on generic tokens ("Services",
+        # "Limited") that occur in body text; the block holds only the addressee,
+        # so a hit means the client really is the recipient. No block → no match
+        # (the page goes to AI/review instead of risking a wrong auto-route).
         matched_client: str | None = None
         match_score: float | None = None
         match_margin: float | None = None
-        if client_list:
-            text_upper = ocr_text.upper()
+        if client_list and recipient_block:
+            block_upper = recipient_block.upper()
             scored = sorted(
                 (
-                    (fuzz.partial_ratio(_significant_name(c).upper(), text_upper), c)
+                    (fuzz.partial_ratio(_significant_name(c).upper(), block_upper), c)
                     for c in client_list
                 ),
                 key=lambda t: t[0],
@@ -567,6 +568,7 @@ def process_pdf(
             "barcode_fields": barcode_fields,
             "recipient_name": recipient_name,
             "recipient_confidence": recipient_conf,
+            "recipient_block": recipient_block,
             "matched_client": matched_client,
             "match_score": match_score,
             "ai": None,
