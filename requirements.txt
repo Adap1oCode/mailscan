@@ -5,6 +5,7 @@ PyMuPDF
 pytesseract
 git+https://github.com/NaturalHistoryMuseum/pylibdmtx.git
 rapidfuzz
+boto3                    # AWS Textract — AI fallback recipient extraction
 opencv-python-headless
 numpy
 Pillow

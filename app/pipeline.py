@@ -370,6 +370,31 @@ def _significant_name(name: str) -> str:
     return " ".join(tokens) if tokens else name
 
 
+def _match_clients(
+    text: str | None, client_list: list[str] | None
+) -> tuple[str | None, float | None, float | None]:
+    """
+    Match a client list against text (the recipient address block, or an AI-
+    extracted block). Returns (matched_client, score, margin) — margin is the gap
+    to the 2nd-best candidate (ambiguity check). No match → (None, None, None).
+    """
+    if not client_list or not text:
+        return None, None, None
+    from rapidfuzz import fuzz
+
+    text_upper = text.upper()
+    scored = sorted(
+        ((fuzz.partial_ratio(_significant_name(c).upper(), text_upper), c) for c in client_list),
+        key=lambda t: t[0],
+        reverse=True,
+    )
+    if not scored or scored[0][0] < _MATCH_CUTOFF:
+        return None, None, None
+    best_score, best_client = scored[0]
+    second = scored[1][0] if len(scored) > 1 else 0.0
+    return best_client, round(best_score, 1), round(best_score - second, 1)
+
+
 def _normalise_postcode(pc: str) -> str:
     """Re-insert the space in a packed postcode: 'LU48DP' -> 'LU4 8DP'."""
     pc = pc.replace(" ", "").upper()
@@ -490,6 +515,7 @@ def process_pdf(
     dpi: int = 300,
     enable_ai: bool = False,
     ai_prefer: str | None = None,
+    ai_credentials: dict | None = None,
 ) -> dict[str, Any]:
     """
     Process a PDF scan and return structured per-page results.
@@ -507,7 +533,6 @@ def process_pdf(
     recipient_confidence, decision ('auto'|'ai'|'review'), confidence (0-100),
     reasons[list], and ai (provider result dict or None).
     """
-    from rapidfuzz import fuzz
     from .ai_fallback import ai_extract
 
     pages = []
@@ -536,27 +561,9 @@ def process_pdf(
 
         # Client match — scoped to the recipient ADDRESS BLOCK, not the whole page.
         # Matching the full page false-positives on generic tokens ("Services",
-        # "Limited") that occur in body text; the block holds only the addressee,
-        # so a hit means the client really is the recipient. No block → no match
-        # (the page goes to AI/review instead of risking a wrong auto-route).
-        matched_client: str | None = None
-        match_score: float | None = None
-        match_margin: float | None = None
-        if client_list and recipient_block:
-            block_upper = recipient_block.upper()
-            scored = sorted(
-                (
-                    (fuzz.partial_ratio(_significant_name(c).upper(), block_upper), c)
-                    for c in client_list
-                ),
-                key=lambda t: t[0],
-                reverse=True,
-            )
-            if scored and scored[0][0] >= _MATCH_CUTOFF:
-                best_score, matched_client = scored[0]
-                second = scored[1][0] if len(scored) > 1 else 0.0
-                match_score = round(best_score, 1)
-                match_margin = round(best_score - second, 1)
+        # "Limited") in body text; the block holds only the addressee. No block →
+        # no match (the page goes to AI/review instead of risking a wrong route).
+        matched_client, match_score, match_margin = _match_clients(recipient_block, client_list)
 
         page: dict[str, Any] = {
             "page": i + 1,
@@ -580,7 +587,7 @@ def process_pdf(
         if enable_ai and assessment["decision"] == "ai":
             ai = ai_extract(
                 _png_bytes(img),
-                {"ocr_text": ocr_text, "postcode": postcode},
+                {"ocr_text": ocr_text, "postcode": postcode, "credentials": ai_credentials or {}},
                 prefer=ai_prefer,
             )
             if ai is not None:
@@ -590,6 +597,14 @@ def process_pdf(
                     page["recipient_confidence"] = ai.confidence
                 if ai.postcode and not page["postcode"]:
                     page["postcode"] = ai.postcode
+                # Re-match the client list against the AI-extracted address block —
+                # this is what turns an AI extraction into an AUTO routing.
+                if ai.address:
+                    ai_client, ai_score, ai_margin = _match_clients(ai.address, client_list)
+                    if ai_client:
+                        page["matched_client"] = matched_client = ai_client
+                        page["match_score"] = match_score = ai_score
+                        match_margin = ai_margin
                 assessment = _assess_confidence(page, match_margin)
                 if assessment["decision"] == "ai":
                     # AI ran but still couldn't resolve confidently → human review.
