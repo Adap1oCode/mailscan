@@ -23,8 +23,11 @@ context shape:
 """
 from __future__ import annotations
 
+import json
 import os
 import re
+import time
+import urllib.request
 from dataclasses import asdict, dataclass
 from typing import Optional
 
@@ -123,6 +126,109 @@ class TextractProvider(AIProvider):
         )
 
 
+def _openrouter_chat(api_key: str, model: str, system: str, user: str, json_mode: bool = True, retries: int = 3) -> str:
+    """One OpenRouter chat completion (with retry/backoff). Used for reasoning + summary."""
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    data = json.dumps(body).encode()
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(
+                "https://openrouter.ai/api/v1/chat/completions",
+                data=data,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            )
+            resp = json.load(urllib.request.urlopen(req, timeout=90))
+            content = (resp.get("choices") or [{}])[0].get("message", {}).get("content")
+            if content and content.strip():
+                return content.strip()
+            last_err = RuntimeError("empty completion")
+        except Exception as e:  # transient HTTP / network / parse — retry
+            last_err = e
+        time.sleep(1.5 * (attempt + 1))
+    raise last_err or RuntimeError("openrouter failed")
+
+
+def _openrouter_model(context: dict) -> tuple[Optional[str], str]:
+    c = _creds(context, "openrouter")
+    api_key = c.get("api_key") or os.environ.get("OPENROUTER_API_KEY")
+    model = c.get("model") or os.environ.get("OPENROUTER_MODEL") or "deepseek/deepseek-chat"
+    return api_key, model
+
+
+class OpenRouterProvider(AIProvider):
+    """
+    Reasoning provider via OpenRouter (any model, e.g. DeepSeek). Works on TEXT
+    (the OCR/Textract output in context["ocr_text"]) — it reasons out *who the
+    letter is addressed to*, which pure OCR/layout engines get wrong on messy mail.
+    """
+    name = "openrouter"
+
+    def available(self, context: dict) -> bool:
+        return bool(_openrouter_model(context)[0])
+
+    def extract(self, image_png: bytes, context: dict) -> AIResult:
+        api_key, model = _openrouter_model(context)
+        text = (context or {}).get("ocr_text", "") or ""
+        if not api_key or not text.strip():
+            raise NotImplementedError("no openrouter credentials/text")
+        out = _openrouter_chat(
+            api_key,
+            model,
+            "You identify the single recipient a UK letter is addressed TO (the "
+            "person or company it is delivered to — NOT the sender/letterhead). "
+            'Reply ONLY with JSON: {"recipient_name": string|null, "postcode": string|null}. '
+            "Use null if genuinely unclear.",
+            text[:6000],
+        )
+        try:
+            data = json.loads(out)
+        except Exception:
+            data = {"recipient_name": out[:80] or None}
+        name = data.get("recipient_name") or None
+        return AIResult(
+            recipient_name=name,
+            address=name,  # so the pipeline can re-match the client list against it
+            postcode=data.get("postcode"),
+            confidence=0.8 if name else 0.3,
+            provider=f"openrouter:{model}",
+        )
+
+
+def ai_summarise(text: str, context: dict | None = None) -> Optional[dict]:
+    """
+    Client-facing summary of a letter (Hoxton-style) via OpenRouter. Returns a dict
+    of structured fields, or None if unavailable. Never raises.
+    """
+    context = context or {}
+    api_key, model = _openrouter_model(context)
+    if not api_key or not (text or "").strip():
+        return None
+    try:
+        out = _openrouter_chat(
+            api_key,
+            model,
+            "You summarise a scanned UK letter for the recipient's virtual-mailroom "
+            "inbox — so they grasp it without opening the full scan. Return ONLY JSON: "
+            '{"mail_type": string, "sender": string, "summary": string (1-2 plain '
+            'sentences with the key point/action), "action_required": string|null, '
+            '"due_date": string|null, "reference": string|null, "amount": string|null}. '
+            "Be concise and factual; use null when a field is absent.",
+            (text or "")[:8000],
+        )
+        return json.loads(out)
+    except Exception:
+        return None
+
+
 class GeminiProvider(AIProvider):
     name = "gemini"
 
@@ -166,6 +272,7 @@ class MockProvider(AIProvider):
 # Real providers first (preferred when usable), mock last as a fallback.
 _REGISTRY: list[AIProvider] = [
     TextractProvider(),
+    OpenRouterProvider(),
     GeminiProvider(),
     ClaudeProvider(),
     MockProvider(),
