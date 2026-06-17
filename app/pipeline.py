@@ -323,13 +323,16 @@ def _assess_confidence(page: dict, match_margin: float | None) -> dict:
         return {"decision": "auto", "confidence": 90, "reasons": reasons}
     if mm and pc and shared:
         reasons.append("Shared-office postcode → a client match is required to route")
-    # We could not confidently map to a client.
-    if good_name:
-        reasons.append(f"Recipient '{name}' extracted but no client match → human review")
-        return {"decision": "review", "confidence": 55, "reasons": reasons}
-    if text_len > 200:
-        reasons.append("Readable text but no confident recipient → AI extraction")
-        return {"decision": "ai", "confidence": 40, "reasons": reasons}
+    # No confident client match. Give AI a chance to extract a matching recipient
+    # before giving up — the free-stack name is often the sender, not the
+    # addressee, so AI may still find the real recipient. Only if there is no
+    # usable content at all do we go straight to review.
+    if good_name or text_len > 200:
+        if good_name:
+            reasons.append(f"Recipient '{name}' extracted but no client match → AI to confirm")
+        else:
+            reasons.append("Readable text but no confident recipient → AI extraction")
+        return {"decision": "ai", "confidence": 45 if good_name else 40, "reasons": reasons}
     reasons.append("No usable content → human review")
     return {"decision": "review", "confidence": 10, "reasons": reasons}
 

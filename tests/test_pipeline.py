@@ -139,9 +139,9 @@ def test_assess_shared_office_requires_client_match():
     # shared postcode, no recipient at all → AI to extract one
     no_name = _assess_confidence({**base, "recipient_name": None, "recipient_confidence": 0.0, "match_score": None}, None)
     assert no_name["decision"] == "ai"
-    # shared postcode, recipient extracted but NOT matched to a client → review
+    # shared postcode, recipient extracted but NOT matched → AI gets a chance first
     name_no_match = _assess_confidence({**base, "recipient_name": "Acme Ltd", "recipient_confidence": 0.85, "match_score": None}, None)
-    assert name_no_match["decision"] == "review"
+    assert name_no_match["decision"] == "ai"
     # shared postcode + strong client match → auto
     matched = _assess_confidence({**base, "recipient_name": "Acme Ltd", "recipient_confidence": 0.85, "matched_client": "Acme Ltd", "match_score": 100.0}, 100.0)
     assert matched["decision"] == "auto"
