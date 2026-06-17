@@ -11,6 +11,7 @@ import os
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, Security, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.security.api_key import APIKeyHeader
 
 from .pipeline import process_pdf
@@ -88,9 +89,12 @@ async def process_async(
         task = process_pdf_task.delay(pdf_b64, client_list=client_list, dpi=dpi)
         return {"job_id": task.id, "status": "pending"}
 
-    # Sync fallback — no Redis configured
+    # Sync fallback — no Redis configured. Run the CPU-bound pipeline in a
+    # threadpool so it doesn't block the event loop (and other requests / health).
     try:
-        result = process_pdf(pdf_bytes, client_list=client_list, dpi=dpi)
+        result = await run_in_threadpool(
+            process_pdf, pdf_bytes, client_list=client_list, dpi=dpi
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -147,8 +151,13 @@ async def process_sync(
 
     client_list = [c.strip() for c in clients.split(",") if c.strip()] if clients else None
 
+    # Run the CPU-bound pipeline in a threadpool so a heavy OCR job doesn't block
+    # the event loop — otherwise one large PDF freezes the whole service (health
+    # checks included) until it finishes.
     try:
-        result = process_pdf(pdf_bytes, client_list=client_list, dpi=dpi)
+        result = await run_in_threadpool(
+            process_pdf, pdf_bytes, client_list=client_list, dpi=dpi
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

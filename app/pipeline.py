@@ -10,7 +10,7 @@ import os
 import re
 import io
 import xml.etree.ElementTree as ET
-from typing import Any
+from typing import Any, Iterator
 
 import cv2
 import fitz  # PyMuPDF
@@ -29,6 +29,11 @@ elif os.name == "nt":
 # Address parser selection — set ADDRESS_PARSER=libpostal to enable ML-based parsing
 _ADDRESS_PARSER = os.environ.get("ADDRESS_PARSER", "regex").lower()
 
+# Cap the longest rendered side (pixels) to bound peak memory on huge / high-DPI
+# pages. A4 @ 300 DPI is ~3508px, so 4500 leaves headroom for A3 while still
+# clamping pathological inputs that would otherwise OOM the container.
+_MAX_RENDER_PX = int(os.environ.get("MAILSCAN_MAX_RENDER_PX", "4500"))
+
 _POSTCODE_RE = re.compile(r"\b([A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2})\b")
 
 # Mailmark barcode: starts with J (business mail) or similar identifier
@@ -40,17 +45,40 @@ _MAILMARK_RE = re.compile(r"^[A-Z]\d{2}[A-Z0-9]")
 # PDF → images
 # ---------------------------------------------------------------------------
 
-def _pdf_to_images(pdf_bytes: bytes, dpi: int = 300) -> list[np.ndarray]:
+def _effective_dpi(page: "fitz.Page", requested_dpi: int) -> int:
+    """
+    Clamp the render DPI so the longest rendered side stays within _MAX_RENDER_PX.
+    page.rect is in points (1/72 inch); pixels = points / 72 * dpi.
+    """
+    longest_pts = max(page.rect.width, page.rect.height)
+    if longest_pts <= 0:
+        return requested_dpi
+    max_dpi = int(_MAX_RENDER_PX * 72 / longest_pts)
+    # Never drop below 72 DPI — OCR accuracy collapses below that (see TESTS.md).
+    return max(72, min(requested_dpi, max_dpi))
+
+
+def _iter_pdf_images(pdf_bytes: bytes, dpi: int = 300) -> Iterator[np.ndarray]:
+    """
+    Yield one rendered RGB page image at a time.
+
+    Streaming — rather than building a list of every page up front — keeps peak
+    memory at roughly one page regardless of page count. A 300-page batch then
+    uses the same RAM as a single-page letter, which is what stops large scans
+    OOM-ing the container.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    images = []
-    for page in doc:
-        pix = page.get_pixmap(dpi=dpi)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-        if pix.n == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-        images.append(img)
-    doc.close()
-    return images
+    try:
+        for page in doc:
+            pix = page.get_pixmap(dpi=_effective_dpi(page, dpi))
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            if pix.n == 4:
+                img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+            # Copy off the pixmap buffer so it can be freed before the next page.
+            yield img.copy()
+            del pix, img
+    finally:
+        doc.close()
 
 
 # ---------------------------------------------------------------------------
@@ -272,10 +300,11 @@ def process_pdf(
     """
     from rapidfuzz import process as fuzz_process
 
-    images = _pdf_to_images(pdf_bytes, dpi=dpi)
     pages = []
 
-    for i, img in enumerate(images):
+    # Stream pages one at a time — only the result dicts (small JSON) accumulate;
+    # page bitmaps are processed and discarded as we go.
+    for i, img in enumerate(_iter_pdf_images(pdf_bytes, dpi=dpi)):
         processed = _preprocess(img)
         ocr_text = _ocr(processed)
 
