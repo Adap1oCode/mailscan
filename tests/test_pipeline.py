@@ -107,3 +107,60 @@ def test_address_components_none_when_regex_parser():
     from app.pipeline import process_pdf
     result = process_pdf(_make_pdf("14 High Street Luton LU1 1AA"))
     assert result["pages"][0]["address_components"] is None
+
+
+# --- Recipient extraction + confidence gate + AI fallback ------------------
+
+def test_page_has_decision_and_recipient_fields():
+    from app.pipeline import process_pdf
+    page = process_pdf(_make_pdf("Mr John Smith\n14 High Street\nLuton LU1 1AA"))["pages"][0]
+    assert page["decision"] in ("auto", "ai", "review")
+    assert isinstance(page["confidence"], int)
+    assert isinstance(page["reasons"], list) and page["reasons"]
+    assert "recipient_name" in page
+    assert "recipient_confidence" in page
+    assert "ai" in page
+
+
+def test_assess_auto_on_individual_mailmark_postcode():
+    from app.pipeline import _assess_confidence
+    page = {
+        "barcode_type": "mailmark", "postcode": "LU4 8DP", "ocr_text": "x" * 300,
+        "recipient_name": "Mr T Choudhary", "recipient_confidence": 0.85, "match_score": None,
+    }
+    assert _assess_confidence(page, None)["decision"] == "auto"
+
+
+def test_assess_shared_office_needs_recipient():
+    from app.pipeline import _assess_confidence
+    base = {"barcode_type": "mailmark", "postcode": "LU1 2DW", "ocr_text": "x" * 300, "match_score": None}
+    no_name = _assess_confidence({**base, "recipient_name": None, "recipient_confidence": 0.0}, None)
+    assert no_name["decision"] == "ai"  # shared postcode, no name → AI
+    with_name = _assess_confidence({**base, "recipient_name": "Acme Ltd", "recipient_confidence": 0.85}, None)
+    assert with_name["decision"] == "auto"
+
+
+def test_assess_review_on_blank_page():
+    from app.pipeline import _assess_confidence
+    page = {
+        "barcode_type": "unknown", "postcode": None, "ocr_text": "",
+        "recipient_name": None, "recipient_confidence": 0.0, "match_score": None,
+    }
+    assert _assess_confidence(page, None)["decision"] == "review"
+
+
+def test_ai_fallback_module_mock():
+    from app.ai_fallback import ai_extract, available_providers
+    assert "mock" in available_providers()
+    res = ai_extract(b"", {"ocr_text": "Acme Ltd\nLondon"})
+    assert res is not None and res.provider == "mock"
+
+
+def test_ai_fallback_invoked_when_enabled():
+    from app.pipeline import process_pdf
+    # No barcode + multi-line body (insert_text does not wrap) → gate routes to
+    # 'ai'; the mock provider is attempted.
+    body = "\n".join(f"This is letter body line number {i} with some content." for i in range(8))
+    page = process_pdf(_make_pdf(body), enable_ai=True)["pages"][0]
+    assert page["ai"] is not None
+    assert page["ai"]["provider"] == "mock"

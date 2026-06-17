@@ -38,10 +38,29 @@ _MAX_RENDER_PX = int(os.environ.get("MAILSCAN_MAX_RENDER_PX", "4500"))
 # barcode-free page, which would otherwise scan the whole high-DPI image.
 _DMTX_TIMEOUT_MS = int(os.environ.get("MAILSCAN_DMTX_TIMEOUT_MS", "10000"))
 
+# Decoded payloads shorter than this are scan-noise false positives (e.g. a
+# stray pattern decoding to "0"), not real barcodes — discard them.
+_MIN_BARCODE_LEN = 4
+
 # Minimum score (0–100) for a client fuzzy match. partial_token_set_ratio scores
 # a recipient that appears anywhere in the page text ~100, and non-matches well
 # below, so a high cutoff keeps precision without missing genuine recipients.
 _MATCH_CUTOFF = float(os.environ.get("MAILSCAN_MATCH_CUTOFF", "85"))
+
+# Minimum margin (best − second-best client score) for a match to count as
+# unambiguous. Two near-tied candidates are not confident → hand to AI / review.
+_MATCH_MARGIN = float(os.environ.get("MAILSCAN_MATCH_MARGIN", "10"))
+
+# Minimum recipient-name extraction confidence (0–1) to route on the free stack.
+_NAME_CONF_AUTO = float(os.environ.get("MAILSCAN_NAME_CONF", "0.6"))
+
+# Postcodes that are shared/virtual offices: the postcode is identical for many
+# clients, so the recipient NAME (not the postcode) is what routes there.
+_SHARED_POSTCODES = {
+    p.strip().upper()
+    for p in os.environ.get("MAILSCAN_SHARED_POSTCODES", "LU1 2DW").split(",")
+    if p.strip()
+}
 
 _POSTCODE_RE = re.compile(r"\b([A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2})\b")
 
@@ -172,6 +191,153 @@ def _ocr(img: np.ndarray) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Recipient / address-block extraction (uses hOCR word positions)
+# ---------------------------------------------------------------------------
+
+def _mk_line(ws: list[dict]) -> dict:
+    ws = sorted(ws, key=lambda w: w["x0"])
+    return {
+        "text": " ".join(w["text"] for w in ws).strip(),
+        "x0": min(w["x0"] for w in ws), "x1": max(w["x1"] for w in ws),
+        "y0": min(w["y0"] for w in ws), "y1": max(w["y1"] for w in ws),
+    }
+
+
+def _group_lines(words: list[dict]) -> list[dict]:
+    """Group hOCR words into text lines by vertical proximity (top to bottom)."""
+    if not words:
+        return []
+    ws = sorted(words, key=lambda w: (w["y0"], w["x0"]))
+    heights = sorted(w["y1"] - w["y0"] for w in ws if w["y1"] > w["y0"])
+    tol = (heights[len(heights) // 2] if heights else 10) * 0.6
+    lines, cur = [], [ws[0]]
+    cur_y = (ws[0]["y0"] + ws[0]["y1"]) / 2
+    for w in ws[1:]:
+        cy = (w["y0"] + w["y1"]) / 2
+        if abs(cy - cur_y) <= tol:
+            cur.append(w)
+        else:
+            lines.append(_mk_line(cur))
+            cur, cur_y = [w], cy
+    lines.append(_mk_line(cur))
+    return lines
+
+
+def _looks_like_name(text: str) -> bool:
+    """Heuristic: is this line plausibly a recipient name/company (not a sentence)?"""
+    t = text.strip()
+    if not (2 <= len(t) <= 60) or not re.search(r"[A-Za-z]", t):
+        return False
+    if len(t.split()) > 7:
+        return False
+    if any(x in t.lower() for x in ("www.", "http", "@", ".co", ".com", "dear ")):
+        return False
+    return True
+
+
+def _extract_recipient(
+    lines: list[dict], page_h: int, delivery_postcode: str | None
+) -> tuple[str | None, float, str | None]:
+    """
+    Find the recipient address block — contiguous short lines ending in a postcode,
+    in the upper part of the page — and return (name, confidence, block_text).
+
+    The name is the first line of that block. Confidence is highest when the block
+    ends in the Mailmark delivery postcode. Heuristic by design; low confidence is
+    what triggers the AI fallback.
+    """
+    if not lines:
+        return None, 0.0, None
+    region = [ln for ln in lines if ln["y1"] <= page_h * 0.6]  # recipient sits high
+    dn = (delivery_postcode or "").replace(" ", "").upper()
+
+    pc_hits = []
+    for idx, ln in enumerate(region):
+        m = _POSTCODE_RE.search(ln["text"].upper()) or _BARCODE_POSTCODE_RE.search(
+            ln["text"].replace(" ", "").upper()
+        )
+        if m:
+            pc_hits.append((idx, ln, m.group(1).replace(" ", "").upper()))
+    if not pc_hits:
+        return None, 0.0, None
+
+    chosen = next((h for h in pc_hits if dn and h[2] == dn), pc_hits[0])
+    idx, pc_line, pc_val = chosen
+
+    block = [pc_line]
+    line_h = max(8, pc_line["y1"] - pc_line["y0"])
+    j = idx - 1
+    while j >= 0 and len(block) < 6:
+        above = region[j]
+        if block[0]["y0"] - above["y1"] > line_h * 2.0:
+            break
+        txt = above["text"].strip()
+        if txt and (len(txt.split()) > 8 or len(txt) > 70):
+            break
+        if txt:
+            block.insert(0, above)
+        j -= 1
+
+    name_line = block[0]["text"].strip()
+    block_text = "\n".join(l["text"].strip() for l in block if l["text"].strip())
+    if _looks_like_name(name_line):
+        conf = 0.85 if (dn and pc_val == dn) else 0.6
+        if len(block) < 2:
+            conf = min(conf, 0.4)
+    else:
+        return None, 0.3, block_text
+    return name_line, round(conf, 2), block_text
+
+
+# ---------------------------------------------------------------------------
+# Confidence gate — decide AUTO (free) / AI fallback / human REVIEW
+# ---------------------------------------------------------------------------
+
+def _assess_confidence(page: dict, match_margin: float | None) -> dict:
+    """
+    Decide how to handle a document from its extraction signals.
+    Returns {"decision": auto|ai|review, "confidence": 0-100, "reasons": [...]}.
+    The whole "when to hand off to AI" policy lives here.
+    """
+    reasons: list[str] = []
+    mm = page["barcode_type"] == "mailmark"
+    pc = page["postcode"]
+    shared = bool(pc) and pc.upper() in _SHARED_POSTCODES
+    name = page.get("recipient_name")
+    name_conf = page.get("recipient_confidence") or 0.0
+    score = page.get("match_score")
+    text_len = len(page.get("ocr_text") or "")
+
+    strong_match = bool(score and score >= _MATCH_CUTOFF and (match_margin is None or match_margin >= _MATCH_MARGIN))
+    good_name = bool(name and name_conf >= _NAME_CONF_AUTO)
+
+    if mm and pc:
+        reasons.append(f"Mailmark barcode → delivery postcode {pc} (deterministic)")
+        if not shared:
+            reasons.append("Individual postcode routes directly")
+            return {"decision": "auto", "confidence": 95, "reasons": reasons}
+        reasons.append("Shared-office postcode → recipient name required to route")
+        if strong_match:
+            reasons.append(f"Strong client match: {page.get('matched_client')} ({score})")
+            return {"decision": "auto", "confidence": 90, "reasons": reasons}
+        if good_name:
+            reasons.append(f"Recipient name extracted: {name!r}")
+            return {"decision": "auto", "confidence": 80, "reasons": reasons}
+        reasons.append("No confident recipient name or client match → AI")
+        return {"decision": "ai", "confidence": 50, "reasons": reasons}
+
+    reasons.append("No Mailmark barcode")
+    if good_name and strong_match:
+        reasons.append("Recipient name + client match without barcode")
+        return {"decision": "auto", "confidence": 75, "reasons": reasons}
+    if text_len > 200:
+        reasons.append("Readable text but no confident recipient → AI extraction")
+        return {"decision": "ai", "confidence": 40, "reasons": reasons}
+    reasons.append("No usable content → human review")
+    return {"decision": "review", "confidence": 10, "reasons": reasons}
+
+
+# ---------------------------------------------------------------------------
 # Barcode decode — pylibdmtx + field parsers
 # ---------------------------------------------------------------------------
 
@@ -190,6 +356,8 @@ def _decode_barcode(img: np.ndarray) -> tuple[str | None, str, dict | None]:
         return None, "unknown", None
 
     raw = results[0].data.decode("utf-8", errors="replace").strip()
+    if len(raw) < _MIN_BARCODE_LEN:
+        return None, "unknown", None
     barcode_type, fields = _classify_and_parse_barcode(raw)
     return raw, barcode_type, fields
 
@@ -312,38 +480,38 @@ def _extract_postcode(text: str) -> tuple[str | None, dict | None]:
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _png_bytes(img: np.ndarray) -> bytes:
+    """Encode a page image as PNG for an AI provider."""
+    buf = io.BytesIO()
+    Image.fromarray(img).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def process_pdf(
     pdf_bytes: bytes,
     client_list: list[str] | None = None,
     dpi: int = 300,
+    enable_ai: bool = False,
+    ai_prefer: str | None = None,
 ) -> dict[str, Any]:
     """
-    Process a PDF scan and return structured results.
+    Process a PDF scan and return structured per-page results.
 
     Args:
         pdf_bytes:   Raw PDF file bytes.
         client_list: Optional list of known client names for fuzzy matching.
         dpi:         Render DPI — 300 is optimal for OCR, lower is faster.
+        enable_ai:   If True, pages the confidence gate routes to 'ai' are sent to
+                     the AI fallback (app.ai_fallback). Off by default.
+        ai_prefer:   Preferred AI provider name (e.g. 'textract'); else first available.
 
-    Returns:
-        {
-            "page_count": int,
-            "pages": [
-                {
-                    "page": int,
-                    "ocr_text": str,
-                    "postcode": str | None,
-                    "address_components": dict | None,  # populated when ADDRESS_PARSER=libpostal
-                    "barcode": str | None,
-                    "barcode_type": str,                # 'mailmark' | 'stamp' | 'unknown'
-                    "barcode_fields": dict | None,      # structured fields when type is known
-                    "matched_client": str | None,
-                    "match_score": float | None,
-                }
-            ]
-        }
+    Each page dict contains: page, ocr_text, postcode, address_components, barcode,
+    barcode_type, barcode_fields, matched_client, match_score, recipient_name,
+    recipient_confidence, decision ('auto'|'ai'|'review'), confidence (0-100),
+    reasons[list], and ai (provider result dict or None).
     """
     from rapidfuzz import fuzz
+    from .ai_fallback import ai_extract
 
     pages = []
 
@@ -351,7 +519,7 @@ def process_pdf(
     # page bitmaps are processed and discarded as we go.
     for i, img in enumerate(_iter_pdf_images(pdf_bytes, dpi=dpi)):
         processed = _preprocess(img)
-        ocr_text = _ocr(processed)
+        ocr_text, words = _ocr_with_hocr(processed)
 
         ocr_postcode, address_components = _extract_postcode(ocr_text)
 
@@ -360,29 +528,36 @@ def process_pdf(
         barcode_postcode = (barcode_fields or {}).get("postcode")
 
         # A Mailmark/stamp barcode encodes the machine-readable delivery
-        # (recipient) postcode. That is the authoritative routing destination and
-        # is far more reliable than a regex over a dense page, which can latch
-        # onto an unrelated postcode in the body. Prefer the barcode postcode when
-        # present; fall back to the OCR-extracted one otherwise.
+        # (recipient) postcode — the authoritative routing destination, far more
+        # reliable than a regex over a dense page. Prefer it; OCR is the fallback.
         postcode = barcode_postcode or ocr_postcode
 
+        # Recipient name from the address block (uses hOCR word positions).
+        recipient_name, recipient_conf, _block = _extract_recipient(
+            _group_lines(words), processed.shape[0], postcode
+        )
+
+        # Client match with a best-vs-second margin (ambiguity check).
         matched_client: str | None = None
         match_score: float | None = None
+        match_margin: float | None = None
         if client_list:
             text_upper = ocr_text.upper()
-            best_client: str | None = None
-            best_score = 0.0
-            for client in client_list:
-                # partial_ratio finds the name as a substring anywhere in the
-                # page; significant tokens keep it from matching on initials.
-                score = fuzz.partial_ratio(_significant_name(client).upper(), text_upper)
-                if score > best_score:
-                    best_score, best_client = score, client
-            if best_score >= _MATCH_CUTOFF:
-                matched_client = best_client
+            scored = sorted(
+                (
+                    (fuzz.partial_ratio(_significant_name(c).upper(), text_upper), c)
+                    for c in client_list
+                ),
+                key=lambda t: t[0],
+                reverse=True,
+            )
+            if scored and scored[0][0] >= _MATCH_CUTOFF:
+                best_score, matched_client = scored[0]
+                second = scored[1][0] if len(scored) > 1 else 0.0
                 match_score = round(best_score, 1)
+                match_margin = round(best_score - second, 1)
 
-        pages.append({
+        page: dict[str, Any] = {
             "page": i + 1,
             "ocr_text": ocr_text.strip(),
             "postcode": postcode,
@@ -390,9 +565,41 @@ def process_pdf(
             "barcode": barcode,
             "barcode_type": barcode_type,
             "barcode_fields": barcode_fields,
+            "recipient_name": recipient_name,
+            "recipient_confidence": recipient_conf,
             "matched_client": matched_client,
             "match_score": match_score,
-        })
+            "ai": None,
+        }
+
+        assessment = _assess_confidence(page, match_margin)
+
+        # Hand off to AI only when the gate says so (and AI is enabled).
+        if enable_ai and assessment["decision"] == "ai":
+            ai = ai_extract(
+                _png_bytes(img),
+                {"ocr_text": ocr_text, "postcode": postcode},
+                prefer=ai_prefer,
+            )
+            if ai is not None:
+                page["ai"] = ai.as_dict()
+                if ai.recipient_name and recipient_conf < _NAME_CONF_AUTO:
+                    page["recipient_name"] = ai.recipient_name
+                    page["recipient_confidence"] = ai.confidence
+                if ai.postcode and not page["postcode"]:
+                    page["postcode"] = ai.postcode
+                assessment = _assess_confidence(page, match_margin)
+                if assessment["decision"] == "ai":
+                    # AI ran but still couldn't resolve confidently → human review.
+                    assessment["decision"] = "review"
+                    assessment["reasons"].append(f"AI ({ai.provider}) inconclusive → human review")
+                else:
+                    assessment["reasons"].append(f"AI ({ai.provider}) resolved recipient")
+
+        page["decision"] = assessment["decision"]
+        page["confidence"] = assessment["confidence"]
+        page["reasons"] = assessment["reasons"]
+        pages.append(page)
 
     return {
         "page_count": len(pages),
