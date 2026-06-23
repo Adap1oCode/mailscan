@@ -14,9 +14,9 @@ context shape:
   {
     "ocr_text": str,                       # free-stack OCR (for the mock / hints)
     "credentials": {                       # from MVOS resolveAiCredentials()
-      "textract": {"access_key_id","secret_access_key","region"},
-      "gemini":   {"api_key"},
-      "claude":   {"api_key"},
+      "textract":  {"access_key_id","secret_access_key","region"},
+      "gemini":    {"api_key"},
+      "openrouter":{"api_key","model"},
       ...
     },
   }
@@ -157,6 +157,27 @@ def _openrouter_chat(api_key: str, model: str, system: str, user: str, json_mode
     raise last_err or RuntimeError("openrouter failed")
 
 
+def _loose_json(s: str) -> Optional[dict]:
+    """Parse JSON that may be wrapped in ```fences``` or surrounded by prose."""
+    s = (s or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\n?", "", s)
+        s = re.sub(r"```\s*$", "", s).strip()
+    try:
+        out = json.loads(s)
+        return out if isinstance(out, dict) else None
+    except Exception:
+        pass
+    a, b = s.find("{"), s.rfind("}")
+    if 0 <= a < b:
+        try:
+            out = json.loads(s[a : b + 1])
+            return out if isinstance(out, dict) else None
+        except Exception:
+            pass
+    return None
+
+
 def _openrouter_model(context: dict) -> tuple[Optional[str], str]:
     c = _creds(context, "openrouter")
     api_key = c.get("api_key") or os.environ.get("OPENROUTER_API_KEY")
@@ -189,10 +210,7 @@ class OpenRouterProvider(AIProvider):
             "Use null if genuinely unclear.",
             text[:6000],
         )
-        try:
-            data = json.loads(out)
-        except Exception:
-            data = {"recipient_name": out[:80] or None}
+        data = _loose_json(out) or {"recipient_name": out[:80] or None}
         name = data.get("recipient_name") or None
         return AIResult(
             recipient_name=name,
@@ -224,7 +242,7 @@ def ai_summarise(text: str, context: dict | None = None) -> Optional[dict]:
             "Be concise and factual; use null when a field is absent.",
             (text or "")[:8000],
         )
-        return json.loads(out)
+        return _loose_json(out) or {"mail_type": "Letter", "summary": out[:400]}
     except Exception:
         return None
 
@@ -238,17 +256,6 @@ class GeminiProvider(AIProvider):
     def extract(self, image_png: bytes, context: dict) -> AIResult:
         # TODO: google-genai vision call, structured-JSON recipient prompt.
         raise NotImplementedError("Gemini provider not yet wired")
-
-
-class ClaudeProvider(AIProvider):
-    name = "claude"
-
-    def available(self, context: dict) -> bool:
-        return bool(_creds(context, "claude").get("api_key") or os.environ.get("ANTHROPIC_API_KEY"))
-
-    def extract(self, image_png: bytes, context: dict) -> AIResult:
-        # TODO: anthropic messages API, image block + structured-output prompt.
-        raise NotImplementedError("Claude provider not yet wired")
 
 
 class MockProvider(AIProvider):
@@ -274,7 +281,6 @@ _REGISTRY: list[AIProvider] = [
     TextractProvider(),
     OpenRouterProvider(),
     GeminiProvider(),
-    ClaudeProvider(),
     MockProvider(),
 ]
 

@@ -318,9 +318,12 @@ def _assess_confidence(page: dict, match_margin: float | None) -> dict:
     if strong_match:
         reasons.append(f"Matched client: {page.get('matched_client')} ({score})")
         return {"decision": "auto", "confidence": 95 if mm else 85, "reasons": reasons}
+    # NOTE: a bare individual (non-shared) delivery postcode is NOT enough to AUTO
+    # on its own — routing requires knowing WHICH client. Auto-ing on postcode
+    # alone routes mail to nobody (it sent two letters to client=None). Fall through
+    # to AI/review so a recipient is actually identified before routing.
     if mm and pc and not shared:
-        reasons.append("Individual delivery postcode routes directly")
-        return {"decision": "auto", "confidence": 90, "reasons": reasons}
+        reasons.append("Individual delivery postcode, but no client match yet → AI/review")
     if mm and pc and shared:
         reasons.append("Shared-office postcode → a client match is required to route")
     # No confident client match. Give AI a chance to extract a matching recipient
@@ -362,15 +365,31 @@ def _decode_barcode(img: np.ndarray) -> tuple[str | None, str, dict | None]:
     return raw, barcode_type, fields
 
 
+# Legal-form / conjunction tokens that are NOT distinctive — present on most
+# company names, so matching on them alone is noise. "K&N Limited" collapsing to
+# just "Limited" made it fuzzy-match every "...Limited" recipient (it mis-routed
+# "Elsiyam Investment Limited" → "K&N Limited"). Drop these so matching keys on
+# the distinctive part of the name.
+_GENERIC_NAME_TOKENS = {
+    "LTD", "LIMITED", "LLP", "LLC", "PLC", "INC", "CO", "COMPANY", "AND", "THE", "TA",
+}
+
+
 def _significant_name(name: str) -> str:
     """
-    Drop initials / short tokens so client matching keys on the distinctive
-    parts of a name (e.g. 'T M Choudhary' -> 'Choudhary'). Matching the full name
-    against a whole page lets single letters ('T', 'M') and common words ('Ltd')
-    in the body text produce false matches; significant tokens avoid that.
+    Reduce a name to its distinctive tokens for matching. Drops initials / short
+    tokens (single letters: 'T M Choudhary' -> 'Choudhary') AND generic legal
+    forms ('K&N Limited' -> 'K&N', not 'Limited') so neither stray letters nor
+    'Ltd' in body text produce false matches.
     """
-    tokens = [t for t in re.split(r"\s+", name.replace(".", " ")) if len(t) >= 3]
-    return " ".join(tokens) if tokens else name
+    toks = [t for t in re.split(r"\s+", name.replace(".", " ")) if t]
+    sig = [t for t in toks if len(t) >= 3 and t.upper() not in _GENERIC_NAME_TOKENS]
+    if sig:
+        return " ".join(sig)
+    # No distinctive long token (e.g. 'K&N Ltd'): keep distinctive short tokens
+    # like 'K&N' before falling back to the raw name.
+    short = [t for t in toks if t.upper() not in _GENERIC_NAME_TOKENS]
+    return " ".join(short) if short else name
 
 
 def _match_clients(

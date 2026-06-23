@@ -7,6 +7,7 @@ Endpoints:
   POST /process/sync   — upload PDF, block until result (for simple callers)
 """
 import base64
+import json
 import os
 from typing import Any
 
@@ -40,6 +41,45 @@ def _validate_upload(file: UploadFile, dpi: int) -> None:
         raise HTTPException(status_code=400, detail="dpi must be between 72 and 600")
 
 
+def _parse_creds(ai_credentials: str) -> dict | None:
+    """Parse the AI-credentials bundle MVOS passes (org_integrations) — JSON string."""
+    if not ai_credentials or not ai_credentials.strip():
+        return None
+    try:
+        parsed = json.loads(ai_credentials)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _run_pipeline(
+    pdf_bytes: bytes,
+    client_list: list[str] | None,
+    dpi: int,
+    separate: bool,
+    enable_ai: bool,
+    ai_credentials: str,
+    ai_prefer: str,
+) -> dict[str, Any]:
+    """Dispatch to the batch separator pipeline or the per-page pipeline."""
+    creds = _parse_creds(ai_credentials)
+    prefer = ai_prefer.strip() or None
+    if separate:
+        from .batch import process_batch
+
+        return process_batch(
+            pdf_bytes, client_list=client_list, dpi=dpi, ai_credentials=creds, ai_prefer=prefer
+        )
+    return process_pdf(
+        pdf_bytes,
+        client_list=client_list,
+        dpi=dpi,
+        enable_ai=enable_ai,
+        ai_prefer=prefer,
+        ai_credentials=creds,
+    )
+
+
 def _get_celery() -> Any | None:
     """Return Celery app if Redis is configured, otherwise None (sync fallback)."""
     if not os.environ.get("REDIS_URL"):
@@ -65,10 +105,17 @@ async def process_async(
     file: UploadFile = File(..., description="PDF file to process"),
     clients: str = Form(default="", description="Comma-separated client names for fuzzy matching"),
     dpi: int = Form(default=300, description="Render DPI — 300 optimal, lower is faster"),
+    separate: bool = Form(default=False, description="Split a multi-letter batch on MVOS-DOC-SEP and return documents[]"),
+    enable_ai: bool = Form(default=False, description="Allow AI fallback on low-confidence pages/letters"),
+    ai_credentials: str = Form(default="", description="JSON bundle of AI provider creds (from MVOS org_integrations)"),
+    ai_prefer: str = Form(default="", description="Preferred AI provider (e.g. 'openrouter')"),
     _: None = Security(_require_api_key),
 ) -> dict[str, Any]:
     """
     Submit a PDF for processing. Returns a job_id to poll with GET /jobs/{job_id}.
+
+    With separate=true the result is a batch: {page_count, documents:[...]} — one
+    entry per letter (separated, extracted, AI-resolved, summarised).
 
     If Redis is not configured (REDIS_URL not set), falls back to synchronous
     processing and returns the result directly (same shape as GET /jobs/{job_id}
@@ -86,14 +133,22 @@ async def process_async(
         # Async path — submit to Celery
         from .worker import process_pdf_task
         pdf_b64 = base64.b64encode(pdf_bytes).decode()
-        task = process_pdf_task.delay(pdf_b64, client_list=client_list, dpi=dpi)
+        task = process_pdf_task.delay(
+            pdf_b64,
+            client_list=client_list,
+            dpi=dpi,
+            separate=separate,
+            enable_ai=enable_ai,
+            ai_credentials=ai_credentials,
+            ai_prefer=ai_prefer,
+        )
         return {"job_id": task.id, "status": "pending"}
 
     # Sync fallback — no Redis configured. Run the CPU-bound pipeline in a
     # threadpool so it doesn't block the event loop (and other requests / health).
     try:
         result = await run_in_threadpool(
-            process_pdf, pdf_bytes, client_list=client_list, dpi=dpi
+            _run_pipeline, pdf_bytes, client_list, dpi, separate, enable_ai, ai_credentials, ai_prefer
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -137,6 +192,10 @@ async def process_sync(
     file: UploadFile = File(..., description="PDF file to process"),
     clients: str = Form(default="", description="Comma-separated client names for fuzzy matching"),
     dpi: int = Form(default=300, description="Render DPI — 300 optimal, lower is faster"),
+    separate: bool = Form(default=False, description="Split a multi-letter batch on MVOS-DOC-SEP and return documents[]"),
+    enable_ai: bool = Form(default=False, description="Allow AI fallback on low-confidence pages/letters"),
+    ai_credentials: str = Form(default="", description="JSON bundle of AI provider creds (from MVOS org_integrations)"),
+    ai_prefer: str = Form(default="", description="Preferred AI provider (e.g. 'openrouter')"),
     _: None = Security(_require_api_key),
 ) -> dict[str, Any]:
     """
@@ -156,7 +215,7 @@ async def process_sync(
     # checks included) until it finishes.
     try:
         result = await run_in_threadpool(
-            process_pdf, pdf_bytes, client_list=client_list, dpi=dpi
+            _run_pipeline, pdf_bytes, client_list, dpi, separate, enable_ai, ai_credentials, ai_prefer
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
