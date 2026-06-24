@@ -447,6 +447,8 @@ def _parse_mailmark(raw: str) -> dict:
     """
     Parse Royal Mail Mailmark business mail barcode fields.
     Payloads look like "JGB 01E...<delivery postcode>...<return postcode>".
+    The first postcode is the delivery (recipient) address; the second is the
+    return (sender) address — e.g. BX9 1BB = HMRC, SW1H 9AJ = Companies House.
     Returns whatever fields can be extracted — partial results are valid.
     """
     cleaned = raw.strip()
@@ -455,9 +457,11 @@ def _parse_mailmark(raw: str) -> dict:
         compact = cleaned.replace(" ", "").upper()
         fields["version"] = compact[0] if compact else None  # 'J'
         fields["mail_class"] = compact[1:3] if len(compact) > 2 else None  # 'GB'
-        postcode = _postcode_from_barcode(cleaned)
-        if postcode:
-            fields["postcode"] = postcode
+        pcs = _BARCODE_POSTCODE_RE.findall(compact)
+        if pcs:
+            fields["postcode"] = _normalise_postcode(pcs[0])
+        if len(pcs) > 1:
+            fields["return_postcode"] = _normalise_postcode(pcs[1])
     except Exception:
         pass
     return fields

@@ -127,6 +127,7 @@ def process_batch(
             "carrier_page": carrier["page"],
             "barcode_type": carrier["barcode_type"],
             "postcode": carrier["postcode"],
+            "barcode_return_postcode": (carrier.get("barcode_fields") or {}).get("return_postcode"),
             "recipient_name": carrier.get("recipient_name"),
             "matched_client": carrier.get("matched_client"),
             "match_score": carrier.get("match_score"),
