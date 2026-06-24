@@ -17,7 +17,7 @@ into a mail_items ingest. mailscan stays credential-free: AI creds are passed in
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import fitz  # PyMuPDF
 import numpy as np
@@ -92,6 +92,7 @@ def process_batch(
     dpi: int = 300,
     ai_credentials: Optional[dict] = None,
     ai_prefer: Optional[str] = None,
+    on_progress: Optional[Callable[[str, int, int], None]] = None,
 ) -> dict[str, Any]:
     """Separate a batch into letters with tiered extraction + summary."""
     creds = ai_credentials or {}
@@ -99,15 +100,22 @@ def process_batch(
     has_openrouter = bool(creds.get("openrouter"))
 
     # 1. free stack over the whole batch (no AI yet — cheaper, per-letter AI below)
+    if on_progress:
+        on_progress("ocr", 0, 1)
     base = process_pdf(pdf_bytes, client_list=client_list, dpi=dpi, enable_ai=False)
     pages = {p["page"]: p for p in base["pages"]}
+    if on_progress:
+        on_progress("ocr", 1, 1)
 
     # 2. deterministic split
     separators = _detect_separators(pdf_bytes)
     groups = _group_documents(pages, separators)
 
     documents: list[dict[str, Any]] = []
+    total_letters = len(groups)
     for did, pgs in enumerate(groups, start=1):
+        if on_progress:
+            on_progress("ai", did - 1, total_letters)
         carrier = next(
             (pages[n] for n in pgs if pages[n]["barcode_type"] == "mailmark"),
             pages[pgs[0]],
@@ -154,5 +162,7 @@ def process_batch(
         rec["summary"] = ai_summarise(combined, {"credentials": creds}) if has_openrouter else None
         rec["ocr"] = [{"page": n, "text": pages[n]["ocr_text"]} for n in pgs]
         documents.append(rec)
+        if on_progress:
+            on_progress("ai", did, total_letters)
 
     return {"page_count": base["page_count"], "separators": sorted(separators), "documents": documents}

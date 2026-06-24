@@ -178,13 +178,70 @@ def job_status(
     if state == "PENDING":
         return {"job_id": job_id, "status": "pending", "result": None}
     if state == "STARTED" or state == "PROCESSING":
-        return {"job_id": job_id, "status": "processing", "result": None}
+        return {"job_id": job_id, "status": "processing", "result": None, "progress": None}
+    if state == "PROGRESS":
+        info = task.info or {}
+        return {
+            "job_id": job_id,
+            "status": "processing",
+            "result": None,
+            "progress": {
+                "step": info.get("step", ""),
+                "current": int(info.get("current", 0)),
+                "total": int(info.get("total", 0)),
+            },
+        }
     if state == "SUCCESS":
         return {"job_id": job_id, "status": "complete", "result": task.result}
     if state == "FAILURE":
         return {"job_id": job_id, "status": "error", "result": None, "error": str(task.result)}
 
     return {"job_id": job_id, "status": state.lower(), "result": None}
+
+
+@app.post("/ai/letter")
+async def ai_letter(
+    ocr_text: str = Form(..., description="Full OCR text of the letter pages (concatenated)"),
+    ai_credentials: str = Form(default="", description="JSON bundle of AI provider creds"),
+    ai_prefer: str = Form(default="openrouter", description="Preferred AI provider"),
+    _: None = Security(_require_api_key),
+) -> dict[str, Any]:
+    """
+    Run AI extraction + summary on a single letter using its OCR text only (no PDF needed).
+    Used for per-letter AI re-runs without re-processing the whole batch.
+
+    Returns:
+      { recipient_name: str|null, summary: {mail_type, sender, summary, action_required}|null }
+    """
+    import json as _json
+
+    creds: dict = {}
+    if ai_credentials.strip():
+        try:
+            creds = _json.loads(ai_credentials)
+        except Exception:
+            pass
+    prefer = ai_prefer.strip() or "openrouter"
+
+    from .ai_fallback import ai_extract, ai_summarise
+
+    extraction = None
+    if creds.get("openrouter") or creds.get("textract"):
+        extraction = ai_extract(b"", {"ocr_text": ocr_text, "credentials": creds}, prefer=prefer)
+
+    summary_obj = None
+    if creds.get("openrouter"):
+        summary_obj = ai_summarise(ocr_text, {"credentials": creds})
+
+    return {
+        "recipient_name": extraction.recipient_name if extraction else None,
+        "summary": {
+            "mail_type": summary_obj.mail_type if summary_obj else None,
+            "sender": summary_obj.sender if summary_obj else None,
+            "summary": summary_obj.summary if summary_obj else None,
+            "action_required": summary_obj.action_required if summary_obj else None,
+        } if summary_obj else None,
+    }
 
 
 @app.post("/process/sync")

@@ -55,8 +55,12 @@ def process_pdf_task(
     if separate:
         from .batch import process_batch
 
+        def _progress(step: str, current: int, total: int) -> None:
+            self.update_state(state="PROGRESS", meta={"step": step, "current": current, "total": total})
+
         return process_batch(
-            pdf_bytes, client_list=client_list, dpi=dpi, ai_credentials=creds, ai_prefer=prefer
+            pdf_bytes, client_list=client_list, dpi=dpi, ai_credentials=creds, ai_prefer=prefer,
+            on_progress=_progress,
         )
     from .pipeline import process_pdf
 
