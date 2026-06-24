@@ -236,10 +236,10 @@ async def ai_letter(
     return {
         "recipient_name": extraction.recipient_name if extraction else None,
         "summary": {
-            "mail_type": summary_obj.mail_type if summary_obj else None,
-            "sender": summary_obj.sender if summary_obj else None,
-            "summary": summary_obj.summary if summary_obj else None,
-            "action_required": summary_obj.action_required if summary_obj else None,
+            "mail_type": summary_obj.get("mail_type"),
+            "sender": summary_obj.get("sender"),
+            "summary": summary_obj.get("summary"),
+            "action_required": summary_obj.get("action_required"),
         } if summary_obj else None,
     }
 
