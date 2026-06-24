@@ -38,9 +38,10 @@ _PC_RE = re.compile(r"([A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2})")
 @dataclass
 class AIResult:
     """Structured recipient extracted by an AI provider."""
-    recipient_name: Optional[str] = None
-    company: Optional[str] = None
-    address: Optional[str] = None
+    recipient_name: Optional[str] = None   # best display label (company or individual)
+    company: Optional[str] = None          # registered company/organisation name
+    individual_name: Optional[str] = None  # personal name (title + surname etc.)
+    address: Optional[str] = None          # street address lines (no postcode)
     postcode: Optional[str] = None
     is_continuation: Optional[bool] = None
     confidence: float = 0.0
@@ -204,19 +205,34 @@ class OpenRouterProvider(AIProvider):
         out = _openrouter_chat(
             api_key,
             model,
-            "You identify the single recipient a UK letter is addressed TO (the "
-            "person or company it is delivered to — NOT the sender/letterhead). "
-            'Reply ONLY with JSON: {"recipient_name": string|null, "postcode": string|null}. '
-            "Use null if genuinely unclear.",
+            "You identify the DELIVERY RECIPIENT of a UK letter — the person or company "
+            "it is physically addressed to, NOT the sender or letterhead organisation. "
+            "Reply ONLY with JSON (no prose, no markdown): "
+            '{"company_name": string|null, '
+            '"individual_name": string|null, '
+            '"address_lines": string|null, '
+            '"postcode": string|null}. '
+            "company_name: registered business/organisation name (null for personal letters). "
+            "individual_name: personal name including title (null if only a company is named). "
+            "address_lines: street address excluding postcode, lines joined with \\n. "
+            "postcode: UK postcode of the delivery address. "
+            "Use null for any field that is genuinely absent.",
             text[:6000],
         )
-        data = _loose_json(out) or {"recipient_name": out[:80] or None}
-        name = data.get("recipient_name") or None
+        data = _loose_json(out) or {}
+        company = (data.get("company_name") or "").strip() or None
+        individual = (data.get("individual_name") or "").strip() or None
+        address_lines = (data.get("address_lines") or "").strip() or None
+        postcode = (data.get("postcode") or "").strip() or None
+        # Best display label: company if present, else individual
+        recipient_name = company or individual
         return AIResult(
-            recipient_name=name,
-            address=name,  # so the pipeline can re-match the client list against it
-            postcode=data.get("postcode"),
-            confidence=0.8 if name else 0.3,
+            recipient_name=recipient_name,
+            company=company,
+            individual_name=individual,
+            address=address_lines,
+            postcode=postcode,
+            confidence=0.85 if recipient_name else 0.3,
             provider=f"openrouter:{model}",
         )
 
