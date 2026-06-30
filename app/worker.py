@@ -72,3 +72,23 @@ def process_pdf_task(
         ai_prefer=prefer,
         ai_credentials=creds,
     )
+
+
+@celery_app.task(bind=True, name="mailscan.split_batch")
+def split_batch_task(self, pdf_b64: str, dpi: int = 0) -> dict:
+    """
+    Split-only batch separation (no OCR/barcode/match/AI) — the fast first step.
+    Reports PROGRESS state as ("scan", page, total) then ("split", letter, total)
+    so the poller can show a live "page N of M" / "letter N of M" indicator.
+    """
+    import base64
+
+    self.update_state(state="PROCESSING")
+    pdf_bytes = base64.b64decode(pdf_b64)
+
+    from .batch import split_batch
+
+    def _progress(step: str, current: int, total: int) -> None:
+        self.update_state(state="PROGRESS", meta={"step": step, "current": current, "total": total})
+
+    return split_batch(pdf_bytes, dpi=dpi or None, on_progress=_progress)

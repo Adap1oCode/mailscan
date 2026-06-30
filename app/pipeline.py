@@ -34,6 +34,16 @@ _ADDRESS_PARSER = os.environ.get("ADDRESS_PARSER", "regex").lower()
 # clamping pathological inputs that would otherwise OOM the container.
 _MAX_RENDER_PX = int(os.environ.get("MAILSCAN_MAX_RENDER_PX", "4500"))
 
+# Default page render DPI. 200 is the speed/accuracy sweet spot for this pipeline;
+# raise to 300 (env) if OCR accuracy on small print suffers. Callers that pass an
+# explicit dpi override this; callers passing dpi<=0 (or None) get this default.
+_DEFAULT_DPI = int(os.environ.get("MAILSCAN_RENDER_DPI", "200"))
+
+
+def default_render_dpi() -> int:
+    """The configured default render DPI, clamped to the valid 72–600 range."""
+    return max(72, min(600, _DEFAULT_DPI))
+
 # Hard ceiling (ms) for a single Data Matrix scan. Bounds the worst case on a
 # barcode-free page, which would otherwise scan the whole high-DPI image.
 _DMTX_TIMEOUT_MS = int(os.environ.get("MAILSCAN_DMTX_TIMEOUT_MS", "10000"))
@@ -538,7 +548,7 @@ def _png_bytes(img: np.ndarray) -> bytes:
 def process_pdf(
     pdf_bytes: bytes,
     client_list: list[str] | None = None,
-    dpi: int = 300,
+    dpi: int | None = None,
     enable_ai: bool = False,
     ai_prefer: str | None = None,
     ai_credentials: dict | None = None,
@@ -561,6 +571,8 @@ def process_pdf(
     """
     from .ai_fallback import ai_extract
 
+    if not dpi or dpi <= 0:
+        dpi = default_render_dpi()
     pages = []
 
     # Stream pages one at a time — only the result dicts (small JSON) accumulate;

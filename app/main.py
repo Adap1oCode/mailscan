@@ -9,13 +9,16 @@ Endpoints:
 import base64
 import json
 import os
-from typing import Any
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Security, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.security.api_key import APIKeyHeader
 
-from .pipeline import process_pdf
+from .pipeline import default_render_dpi, process_pdf
 
 app = FastAPI(
     title="Mailscan",
@@ -24,6 +27,70 @@ app = FastAPI(
 )
 
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+# ---------------------------------------------------------------------------
+# In-process async job registry (no-Redis fallback)
+#
+# When REDIS_URL is unset there is no Celery worker, yet the clients still want a
+# job_id to poll for live progress (the split step reports "page N of M"). The
+# service runs as a SINGLE uvicorn process (see Dockerfile — no --workers), so a
+# module-level dict guarded by a lock is a safe place to hold job state. Jobs run
+# on a small thread pool; a poll reads the latest progress the worker thread wrote.
+# State is in-memory only — lost on restart, which is acceptable for these jobs.
+# ---------------------------------------------------------------------------
+
+_JOBS: dict[str, dict[str, Any]] = {}
+_JOBS_LOCK = threading.Lock()
+_INPROC_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.environ.get("MAILSCAN_INPROC_WORKERS", "2"))
+)
+# Bound the registry so a long-running service can't leak memory across many jobs.
+_JOBS_MAX = 64
+
+
+def _new_inproc_job() -> str:
+    job_id = uuid.uuid4().hex
+    with _JOBS_LOCK:
+        _JOBS[job_id] = {"status": "processing", "progress": None, "result": None, "error": None}
+        # Evict oldest finished jobs once over the cap (insertion-ordered dict).
+        if len(_JOBS) > _JOBS_MAX:
+            for old in list(_JOBS):
+                if len(_JOBS) <= _JOBS_MAX:
+                    break
+                if old != job_id and _JOBS[old]["status"] in ("complete", "error"):
+                    del _JOBS[old]
+    return job_id
+
+
+def _set_inproc_progress(job_id: str, step: str, current: int, total: int) -> None:
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is not None:
+            job["progress"] = {"step": step, "current": current, "total": total}
+
+
+def _finish_inproc_job(job_id: str, result: Any = None, error: Optional[str] = None) -> None:
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            return
+        if error is not None:
+            job.update(status="error", error=error)
+        else:
+            job.update(status="complete", result=result)
+
+
+def _run_inproc(job_id: str, fn: Callable[[Callable[[str, int, int], None]], Any]) -> None:
+    """Run `fn(progress_cb)` on the pool, recording result/error into the registry."""
+    def _go() -> None:
+        try:
+            result = fn(lambda s, c, t: _set_inproc_progress(job_id, s, c, t))
+            _finish_inproc_job(job_id, result=result)
+        except Exception as exc:  # noqa: BLE001 — surfaced to the poller as job error
+            _finish_inproc_job(job_id, error=str(exc))
+
+    _INPROC_EXECUTOR.submit(_go)
 
 
 def _require_api_key(key: str | None = Security(_api_key_header)) -> None:
@@ -104,7 +171,7 @@ def health() -> dict[str, str]:
 async def process_async(
     file: UploadFile = File(..., description="PDF file to process"),
     clients: str = Form(default="", description="Comma-separated client names for fuzzy matching"),
-    dpi: int = Form(default=300, description="Render DPI — 300 optimal, lower is faster"),
+    dpi: int = Form(default=0, description="Render DPI — defaults to MAILSCAN_RENDER_DPI"),
     separate: bool = Form(default=False, description="Split a multi-letter batch on MVOS-DOC-SEP and return documents[]"),
     enable_ai: bool = Form(default=False, description="Allow AI fallback on low-confidence pages/letters"),
     ai_credentials: str = Form(default="", description="JSON bundle of AI provider creds (from MVOS org_integrations)"),
@@ -121,6 +188,7 @@ async def process_async(
     processing and returns the result directly (same shape as GET /jobs/{job_id}
     with status='complete').
     """
+    dpi = dpi or default_render_dpi()
     _validate_upload(file, dpi)
     pdf_bytes = await file.read()
     if not pdf_bytes:
@@ -156,6 +224,39 @@ async def process_async(
     return {"job_id": None, "status": "complete", "result": result}
 
 
+@app.post("/split")
+async def split_async(
+    file: UploadFile = File(..., description="Batch PDF to split into letters"),
+    dpi: int = Form(default=0, description="Render DPI — defaults to MAILSCAN_RENDER_DPI"),
+    _: None = Security(_require_api_key),
+) -> dict[str, Any]:
+    """
+    Split-only first step: separate a multi-letter batch into per-letter page
+    groups, FAST — no OCR, no full-page barcode scan, no matching, no AI. Returns a
+    job_id to poll with GET /jobs/{job_id}; progress reports ("scan", page, total)
+    then ("split", letter, total). OCR/barcode/AI run later, per letter.
+
+    Async via Celery when REDIS_URL is set; otherwise via the in-process registry.
+    """
+    _validate_upload(file, dpi or default_render_dpi())
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    dpi_val = dpi or default_render_dpi()
+
+    celery = _get_celery()
+    if celery is not None:
+        from .worker import split_batch_task
+        pdf_b64 = base64.b64encode(pdf_bytes).decode()
+        task = split_batch_task.delay(pdf_b64, dpi=dpi_val)
+        return {"job_id": task.id, "status": "pending"}
+
+    from .batch import split_batch
+    job_id = _new_inproc_job()
+    _run_inproc(job_id, lambda cb: split_batch(pdf_bytes, dpi=dpi_val, on_progress=cb))
+    return {"job_id": job_id, "status": "processing"}
+
+
 @app.get("/jobs/{job_id}")
 def job_status(
     job_id: str,
@@ -167,6 +268,19 @@ def job_status(
     Response:
       { "job_id": str, "status": "pending"|"processing"|"complete"|"error", "result": dict|null }
     """
+    # In-process registry first (no-Redis path) — the job ids it mints live here.
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        snapshot = dict(job) if job is not None else None
+    if snapshot is not None:
+        return {
+            "job_id": job_id,
+            "status": snapshot["status"],
+            "result": snapshot["result"],
+            "progress": snapshot["progress"],
+            "error": snapshot["error"],
+        }
+
     celery = _get_celery()
     if celery is None:
         raise HTTPException(status_code=404, detail="Async jobs not available — REDIS_URL not configured")
@@ -252,7 +366,7 @@ async def ai_letter(
 async def process_sync(
     file: UploadFile = File(..., description="PDF file to process"),
     clients: str = Form(default="", description="Comma-separated client names for fuzzy matching"),
-    dpi: int = Form(default=300, description="Render DPI — 300 optimal, lower is faster"),
+    dpi: int = Form(default=0, description="Render DPI — defaults to MAILSCAN_RENDER_DPI"),
     separate: bool = Form(default=False, description="Split a multi-letter batch on MVOS-DOC-SEP and return documents[]"),
     enable_ai: bool = Form(default=False, description="Allow AI fallback on low-confidence pages/letters"),
     ai_credentials: str = Form(default="", description="JSON bundle of AI provider creds (from MVOS org_integrations)"),
@@ -264,6 +378,7 @@ async def process_sync(
     Use for simple integrations (n8n, scripts) that don't want to poll.
     May timeout on large PDFs — use POST /process + GET /jobs/{id} for production.
     """
+    dpi = dpi or default_render_dpi()
     _validate_upload(file, dpi)
     pdf_bytes = await file.read()
     if not pdf_bytes:
