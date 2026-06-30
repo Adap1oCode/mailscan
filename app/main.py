@@ -127,6 +127,7 @@ def _run_pipeline(
     enable_ai: bool,
     ai_credentials: str,
     ai_prefer: str,
+    on_progress: Optional[Callable[[str, int, int], None]] = None,
 ) -> dict[str, Any]:
     """Dispatch to the batch separator pipeline or the per-page pipeline."""
     creds = _parse_creds(ai_credentials)
@@ -135,7 +136,8 @@ def _run_pipeline(
         from .batch import process_batch
 
         return process_batch(
-            pdf_bytes, client_list=client_list, dpi=dpi, ai_credentials=creds, ai_prefer=prefer
+            pdf_bytes, client_list=client_list, dpi=dpi, ai_credentials=creds,
+            ai_prefer=prefer, on_progress=on_progress,
         )
     return process_pdf(
         pdf_bytes,
@@ -212,16 +214,20 @@ async def process_async(
         )
         return {"job_id": task.id, "status": "pending"}
 
-    # Sync fallback — no Redis configured. Run the CPU-bound pipeline in a
-    # threadpool so it doesn't block the event loop (and other requests / health).
-    try:
-        result = await run_in_threadpool(
-            _run_pipeline, pdf_bytes, client_list, dpi, separate, enable_ai, ai_credentials, ai_prefer
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    return {"job_id": None, "status": "complete", "result": result}
+    # No Redis configured — run the CPU-bound pipeline on the in-process async
+    # registry and hand back a job_id immediately. This is what stops a heavy OCR
+    # pass (≈20s for a single letter) from being one long blocking HTTP request
+    # that a proxy could time out: the caller polls GET /jobs/{id} for progress and
+    # the result instead. (Single uvicorn process, so the registry is shared.)
+    job_id = _new_inproc_job()
+    _run_inproc(
+        job_id,
+        lambda cb: _run_pipeline(
+            pdf_bytes, client_list, dpi, separate, enable_ai, ai_credentials, ai_prefer,
+            on_progress=cb,
+        ),
+    )
+    return {"job_id": job_id, "status": "processing"}
 
 
 @app.post("/split")

@@ -44,9 +44,12 @@ def default_render_dpi() -> int:
     """The configured default render DPI, clamped to the valid 72–600 range."""
     return max(72, min(600, _DEFAULT_DPI))
 
-# Hard ceiling (ms) for a single Data Matrix scan. Bounds the worst case on a
-# barcode-free page, which would otherwise scan the whole high-DPI image.
-_DMTX_TIMEOUT_MS = int(os.environ.get("MAILSCAN_DMTX_TIMEOUT_MS", "10000"))
+# Hard ceiling (ms) for a single full-page Data Matrix (Mailmark) scan. A barcode
+# that IS present decodes in <100ms; this ceiling only bounds the wasted time on a
+# barcode-free page (libdmtx scans the whole high-DPI image to the deadline on a
+# miss). Most pages of a letter have no barcode, so a high ceiling dominates OCR
+# latency — keep it tight. Missed barcodes fall back to OCR postcode/recipient.
+_DMTX_TIMEOUT_MS = int(os.environ.get("MAILSCAN_DMTX_TIMEOUT_MS", "1500"))
 
 # Decoded payloads shorter than this are scan-noise false positives (e.g. a
 # stray pattern decoding to "0"), not real barcodes — discard them.
