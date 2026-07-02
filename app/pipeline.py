@@ -6,11 +6,12 @@ OCR engine: OCRmyPDF in API mode (hOCR output) for word-level bounding boxes.
 Address parsing: libpostal when ADDRESS_PARSER=libpostal, otherwise regex fallback.
 Barcode: pylibdmtx for Data Matrix decode, with Mailmark + stamp field parsers.
 """
+import logging
 import os
 import re
 import io
 import xml.etree.ElementTree as ET
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator, Optional
 
 import cv2
 import fitz  # PyMuPDF
@@ -18,6 +19,8 @@ import numpy as np
 import pytesseract
 from PIL import Image
 from pylibdmtx.pylibdmtx import decode as dmtx_decode
+
+logger = logging.getLogger("mailscan.pipeline")
 
 # Allow override via env — required on Linux/Mac
 _tess_cmd = os.environ.get("TESSERACT_CMD")
@@ -75,6 +78,33 @@ _SHARED_POSTCODES = {
     if p.strip()
 }
 
+
+class MatchSettings:
+    """
+    Per-request match/gate thresholds — resolved from the caller's `options`
+    payload (options["match"]) with the env-configured values as defaults, so
+    each tenant can tune matching without a redeploy.
+    """
+
+    def __init__(self, options: dict | None = None) -> None:
+        m = (options or {}).get("match") or {}
+        self.cutoff = self._num(m.get("cutoff"), _MATCH_CUTOFF)
+        self.margin = self._num(m.get("margin"), _MATCH_MARGIN)
+        self.name_conf = self._num(m.get("name_conf"), _NAME_CONF_AUTO)
+        pcs = m.get("shared_postcodes")
+        self.shared_postcodes = (
+            {str(p).strip().upper() for p in pcs if str(p).strip()}
+            if isinstance(pcs, list)
+            else _SHARED_POSTCODES
+        )
+
+    @staticmethod
+    def _num(v: object, default: float) -> float:
+        try:
+            return float(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return default
+
 _POSTCODE_RE = re.compile(r"\b([A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2})\b")
 
 # Postcode embedded inside a barcode payload — no surrounding word boundaries,
@@ -106,25 +136,44 @@ def _effective_dpi(page: "fitz.Page", requested_dpi: int) -> int:
     return max(72, min(requested_dpi, max_dpi))
 
 
-def _iter_pdf_images(pdf_bytes: bytes, dpi: int = 300) -> Iterator[np.ndarray]:
+def _iter_pdf_images(
+    pdf_bytes: bytes, dpi: int = 300, page_numbers: list[int] | None = None
+) -> Iterator[tuple[int, np.ndarray]]:
     """
-    Yield one rendered RGB page image at a time.
+    Yield (page_number_1based, grayscale image) one page at a time.
+
+    Grayscale render — OCR, barcode decode, and preprocessing all consume gray,
+    so rendering RGB only to convert it wastes ~3x the render time and memory.
 
     Streaming — rather than building a list of every page up front — keeps peak
     memory at roughly one page regardless of page count. A 300-page batch then
     uses the same RAM as a single-page letter, which is what stops large scans
     OOM-ing the container.
+
+    page_numbers restricts rendering to those 1-based pages (batch mode skips
+    separator sheets and blank backs entirely); None renders every page.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
-        for page in doc:
-            pix = page.get_pixmap(dpi=_effective_dpi(page, dpi))
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-            if pix.n == 4:
-                img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+        numbers = page_numbers if page_numbers is not None else range(1, doc.page_count + 1)
+        for n in numbers:
+            page = doc[n - 1]
+            pix = page.get_pixmap(
+                dpi=_effective_dpi(page, dpi), colorspace=fitz.csGRAY, alpha=False
+            )
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
             # Copy off the pixmap buffer so it can be freed before the next page.
-            yield img.copy()
+            yield n, img.copy()
             del pix, img
+    finally:
+        doc.close()
+
+
+def pdf_page_count(pdf_bytes: bytes) -> int:
+    """Page count of a PDF (raises on a corrupt/non-PDF payload)."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        return doc.page_count
     finally:
         doc.close()
 
@@ -133,10 +182,8 @@ def _iter_pdf_images(pdf_bytes: bytes, dpi: int = 300) -> Iterator[np.ndarray]:
 # Image preprocessing
 # ---------------------------------------------------------------------------
 
-def _preprocess(img: np.ndarray) -> np.ndarray:
-    """Deskew and binarise — improves OCR accuracy on scanned docs."""
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-
+def _preprocess(gray: np.ndarray) -> np.ndarray:
+    """Deskew and binarise a grayscale page — improves OCR accuracy on scanned docs."""
     coords = np.column_stack(np.where(gray < 200))
     if len(coords) > 100:
         angle = cv2.minAreaRect(coords)[-1]
@@ -171,7 +218,7 @@ def _ocr_with_hocr(img: np.ndarray) -> tuple[str, list[dict]]:
             full_text = " ".join(w["text"] for w in words if w["text"].strip())
             return full_text, words
     except Exception:
-        pass
+        logger.warning("hOCR pass failed — falling back to plain OCR (no word boxes)", exc_info=True)
     return pytesseract.image_to_string(pil, config="--psm 6"), []
 
 
@@ -305,23 +352,26 @@ def _extract_recipient(
 # Confidence gate — decide AUTO (free) / AI fallback / human REVIEW
 # ---------------------------------------------------------------------------
 
-def _assess_confidence(page: dict, match_margin: float | None) -> dict:
+def _assess_confidence(
+    page: dict, match_margin: float | None, settings: MatchSettings | None = None
+) -> dict:
     """
     Decide how to handle a document from its extraction signals.
     Returns {"decision": auto|ai|review, "confidence": 0-100, "reasons": [...]}.
     The whole "when to hand off to AI" policy lives here.
     """
+    s = settings or MatchSettings()
     reasons: list[str] = []
     mm = page["barcode_type"] == "mailmark"
     pc = page["postcode"]
-    shared = bool(pc) and pc.upper() in _SHARED_POSTCODES
+    shared = bool(pc) and pc.upper() in s.shared_postcodes
     name = page.get("recipient_name")
     name_conf = page.get("recipient_confidence") or 0.0
     score = page.get("match_score")
     text_len = len(page.get("ocr_text") or "")
 
-    strong_match = bool(score and score >= _MATCH_CUTOFF and (match_margin is None or match_margin >= _MATCH_MARGIN))
-    good_name = bool(name and name_conf >= _NAME_CONF_AUTO)
+    strong_match = bool(score and score >= s.cutoff and (match_margin is None or match_margin >= s.margin))
+    good_name = bool(name and name_conf >= s.name_conf)
 
     if mm and pc:
         reasons.append(f"Mailmark barcode → delivery postcode {pc} (deterministic)")
@@ -406,7 +456,7 @@ def _significant_name(name: str) -> str:
 
 
 def _match_clients(
-    text: str | None, client_list: list[str] | None
+    text: str | None, client_list: list[str] | None, cutoff: float | None = None
 ) -> tuple[str | None, float | None, float | None]:
     """
     Match a client list against text (the recipient address block, or an AI-
@@ -417,13 +467,14 @@ def _match_clients(
         return None, None, None
     from rapidfuzz import fuzz
 
+    min_score = cutoff if cutoff is not None else _MATCH_CUTOFF
     text_upper = text.upper()
     scored = sorted(
         ((fuzz.partial_ratio(_significant_name(c).upper(), text_upper), c) for c in client_list),
         key=lambda t: t[0],
         reverse=True,
     )
-    if not scored or scored[0][0] < _MATCH_CUTOFF:
+    if not scored or scored[0][0] < min_score:
         return None, None, None
     best_score, best_client = scored[0]
     second = scored[1][0] if len(scored) > 1 else 0.0
@@ -555,17 +606,26 @@ def process_pdf(
     enable_ai: bool = False,
     ai_prefer: str | None = None,
     ai_credentials: dict | None = None,
+    page_numbers: list[int] | None = None,
+    on_progress: Optional[Callable[[str, int, int], None]] = None,
+    options: dict | None = None,
 ) -> dict[str, Any]:
     """
     Process a PDF scan and return structured per-page results.
 
     Args:
-        pdf_bytes:   Raw PDF file bytes.
-        client_list: Optional list of known client names for fuzzy matching.
-        dpi:         Render DPI — 300 is optimal for OCR, lower is faster.
-        enable_ai:   If True, pages the confidence gate routes to 'ai' are sent to
-                     the AI fallback (app.ai_fallback). Off by default.
-        ai_prefer:   Preferred AI provider name (e.g. 'textract'); else first available.
+        pdf_bytes:    Raw PDF file bytes.
+        client_list:  Optional list of known client names for fuzzy matching.
+        dpi:          Render DPI — 300 is optimal for OCR, lower is faster.
+        enable_ai:    If True, pages the confidence gate routes to 'ai' are sent to
+                      the AI fallback (app.ai_fallback). Off by default.
+        ai_prefer:    Preferred AI provider name (e.g. 'textract'); else first available.
+        page_numbers: Optional 1-based page subset to process (batch mode skips
+                      separator sheets/blanks). None processes every page.
+        on_progress:  Optional callback ("ocr", pages_done, pages_total) — one call
+                      per page so long batches show live progress.
+        options:      Per-request overrides (prompts/models/limits/match) — the
+                      tenant-override channel; see ai_fallback options docs.
 
     Each page dict contains: page, ocr_text, postcode, address_components, barcode,
     barcode_type, barcode_fields, matched_client, match_score, recipient_name,
@@ -576,11 +636,16 @@ def process_pdf(
 
     if not dpi or dpi <= 0:
         dpi = default_render_dpi()
+    settings = MatchSettings(options)
     pages = []
+    doc_page_count = pdf_page_count(pdf_bytes)
+    total = len(page_numbers) if page_numbers is not None else doc_page_count
 
     # Stream pages one at a time — only the result dicts (small JSON) accumulate;
     # page bitmaps are processed and discarded as we go.
-    for i, img in enumerate(_iter_pdf_images(pdf_bytes, dpi=dpi)):
+    for i, (page_no, img) in enumerate(_iter_pdf_images(pdf_bytes, dpi=dpi, page_numbers=page_numbers)):
+        if on_progress:
+            on_progress("ocr", i, total)
         processed = _preprocess(img)
         ocr_text, words = _ocr_with_hocr(processed)
 
@@ -604,10 +669,12 @@ def process_pdf(
         # Matching the full page false-positives on generic tokens ("Services",
         # "Limited") in body text; the block holds only the addressee. No block →
         # no match (the page goes to AI/review instead of risking a wrong route).
-        matched_client, match_score, match_margin = _match_clients(recipient_block, client_list)
+        matched_client, match_score, match_margin = _match_clients(
+            recipient_block, client_list, cutoff=settings.cutoff
+        )
 
         page: dict[str, Any] = {
-            "page": i + 1,
+            "page": page_no,
             "ocr_text": ocr_text.strip(),
             "postcode": postcode,
             "address_components": address_components,
@@ -622,18 +689,23 @@ def process_pdf(
             "ai": None,
         }
 
-        assessment = _assess_confidence(page, match_margin)
+        assessment = _assess_confidence(page, match_margin, settings)
 
         # Hand off to AI only when the gate says so (and AI is enabled).
         if enable_ai and assessment["decision"] == "ai":
             ai = ai_extract(
                 _png_bytes(img),
-                {"ocr_text": ocr_text, "postcode": postcode, "credentials": ai_credentials or {}},
+                {
+                    "ocr_text": ocr_text,
+                    "postcode": postcode,
+                    "credentials": ai_credentials or {},
+                    "options": options or {},
+                },
                 prefer=ai_prefer,
             )
             if ai is not None:
                 page["ai"] = ai.as_dict()
-                if ai.recipient_name and recipient_conf < _NAME_CONF_AUTO:
+                if ai.recipient_name and recipient_conf < settings.name_conf:
                     page["recipient_name"] = ai.recipient_name
                     page["recipient_confidence"] = ai.confidence
                 if ai.postcode and not page["postcode"]:
@@ -641,12 +713,14 @@ def process_pdf(
                 # Re-match the client list against the AI-extracted address block —
                 # this is what turns an AI extraction into an AUTO routing.
                 if ai.address:
-                    ai_client, ai_score, ai_margin = _match_clients(ai.address, client_list)
+                    ai_client, ai_score, ai_margin = _match_clients(
+                        ai.address, client_list, cutoff=settings.cutoff
+                    )
                     if ai_client:
                         page["matched_client"] = matched_client = ai_client
                         page["match_score"] = match_score = ai_score
                         match_margin = ai_margin
-                assessment = _assess_confidence(page, match_margin)
+                assessment = _assess_confidence(page, match_margin, settings)
                 if assessment["decision"] == "ai":
                     # AI ran but still couldn't resolve confidently → human review.
                     assessment["decision"] = "review"
@@ -659,7 +733,12 @@ def process_pdf(
         page["reasons"] = assessment["reasons"]
         pages.append(page)
 
+    if on_progress:
+        on_progress("ocr", total, total)
+
     return {
-        "page_count": len(pages),
+        # Full document page count even when a subset was processed — callers use
+        # this as "pages in the PDF", not "pages in this result".
+        "page_count": doc_page_count,
         "pages": pages,
     }

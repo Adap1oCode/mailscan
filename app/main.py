@@ -7,9 +7,11 @@ Endpoints:
   POST /process/sync   — upload PDF, block until result (for simple callers)
 """
 import base64
-import json
+import logging
 import os
+import secrets
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional
@@ -18,7 +20,10 @@ from fastapi import FastAPI, File, Form, HTTPException, Security, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.security.api_key import APIKeyHeader
 
-from .pipeline import default_render_dpi, process_pdf
+from .ai_fallback import parse_credentials, parse_json_object
+from .pipeline import default_render_dpi, pdf_page_count, process_pdf
+
+logger = logging.getLogger("mailscan.api")
 
 app = FastAPI(
     title="Mailscan",
@@ -46,20 +51,37 @@ _INPROC_EXECUTOR = ThreadPoolExecutor(
     max_workers=int(os.environ.get("MAILSCAN_INPROC_WORKERS", "2"))
 )
 # Bound the registry so a long-running service can't leak memory across many jobs.
-_JOBS_MAX = 64
+_JOBS_MAX = int(os.environ.get("MAILSCAN_JOBS_MAX", "64"))
+# Finished results (which can be MBs of OCR text each) expire after this many
+# seconds even when the registry is under the cap — mirrors Celery result_expires.
+_JOB_TTL_SEC = float(os.environ.get("MAILSCAN_JOB_TTL_SEC", "3600"))
+
+
+def _evict_jobs_locked(keep: str | None = None) -> None:
+    """Drop expired finished jobs, then oldest finished jobs while over the cap.
+    Caller must hold _JOBS_LOCK. In-flight jobs are never evicted."""
+    now = time.monotonic()
+    for jid in list(_JOBS):
+        job = _JOBS[jid]
+        finished_at = job.get("finished_at")
+        if jid != keep and finished_at is not None and now - finished_at > _JOB_TTL_SEC:
+            del _JOBS[jid]
+    if len(_JOBS) > _JOBS_MAX:
+        for jid in list(_JOBS):
+            if len(_JOBS) <= _JOBS_MAX:
+                break
+            if jid != keep and _JOBS[jid]["status"] in ("complete", "error"):
+                del _JOBS[jid]
 
 
 def _new_inproc_job() -> str:
     job_id = uuid.uuid4().hex
     with _JOBS_LOCK:
-        _JOBS[job_id] = {"status": "processing", "progress": None, "result": None, "error": None}
-        # Evict oldest finished jobs once over the cap (insertion-ordered dict).
-        if len(_JOBS) > _JOBS_MAX:
-            for old in list(_JOBS):
-                if len(_JOBS) <= _JOBS_MAX:
-                    break
-                if old != job_id and _JOBS[old]["status"] in ("complete", "error"):
-                    del _JOBS[old]
+        _JOBS[job_id] = {
+            "status": "processing", "progress": None, "result": None, "error": None,
+            "finished_at": None,
+        }
+        _evict_jobs_locked(keep=job_id)
     return job_id
 
 
@@ -76,9 +98,9 @@ def _finish_inproc_job(job_id: str, result: Any = None, error: Optional[str] = N
         if job is None:
             return
         if error is not None:
-            job.update(status="error", error=error)
+            job.update(status="error", error=error, finished_at=time.monotonic())
         else:
-            job.update(status="complete", result=result)
+            job.update(status="complete", result=result, finished_at=time.monotonic())
 
 
 def _run_inproc(job_id: str, fn: Callable[[Callable[[str, int, int], None]], Any]) -> None:
@@ -88,6 +110,7 @@ def _run_inproc(job_id: str, fn: Callable[[Callable[[str, int, int], None]], Any
             result = fn(lambda s, c, t: _set_inproc_progress(job_id, s, c, t))
             _finish_inproc_job(job_id, result=result)
         except Exception as exc:  # noqa: BLE001 — surfaced to the poller as job error
+            logger.exception("in-process job %s failed", job_id)
             _finish_inproc_job(job_id, error=str(exc))
 
     _INPROC_EXECUTOR.submit(_go)
@@ -97,26 +120,38 @@ def _require_api_key(key: str | None = Security(_api_key_header)) -> None:
     api_key = os.environ.get("MAILSCAN_API_KEY", "")
     if not api_key:
         raise HTTPException(status_code=500, detail="MAILSCAN_API_KEY is not configured on the server")
-    if key != api_key:
+    if not secrets.compare_digest(key or "", api_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
-def _validate_upload(file: UploadFile, dpi: int) -> None:
+async def _read_upload(file: UploadFile, dpi: int) -> bytes:
+    """
+    Validate an uploaded PDF and return its bytes. Rejects non-PDF names, bad DPI,
+    empty/oversized payloads, corrupt PDFs, and page counts beyond the cap — a
+    500MB scan would otherwise be read fully into memory (and inflated ~33% again
+    by base64 on the Celery path).
+    """
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted")
     if dpi < 72 or dpi > 600:
         raise HTTPException(status_code=400, detail="dpi must be between 72 and 600")
 
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
-def _parse_creds(ai_credentials: str) -> dict | None:
-    """Parse the AI-credentials bundle MVOS passes (org_integrations) — JSON string."""
-    if not ai_credentials or not ai_credentials.strip():
-        return None
+    max_mb = float(os.environ.get("MAILSCAN_MAX_UPLOAD_MB", "100"))
+    if len(pdf_bytes) > max_mb * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"PDF exceeds the {max_mb:g} MB upload limit")
+
     try:
-        parsed = json.loads(ai_credentials)
-        return parsed if isinstance(parsed, dict) else None
+        page_count = pdf_page_count(pdf_bytes)
     except Exception:
-        return None
+        raise HTTPException(status_code=400, detail="File is not a readable PDF")
+    max_pages = int(os.environ.get("MAILSCAN_MAX_PAGES", "500"))
+    if page_count > max_pages:
+        raise HTTPException(status_code=413, detail=f"PDF has {page_count} pages — limit is {max_pages}")
+    return pdf_bytes
 
 
 def _run_pipeline(
@@ -127,17 +162,19 @@ def _run_pipeline(
     enable_ai: bool,
     ai_credentials: str,
     ai_prefer: str,
+    options: str = "",
     on_progress: Optional[Callable[[str, int, int], None]] = None,
 ) -> dict[str, Any]:
     """Dispatch to the batch separator pipeline or the per-page pipeline."""
-    creds = _parse_creds(ai_credentials)
+    creds = parse_credentials(ai_credentials)
+    opts = parse_json_object(options, "options")
     prefer = ai_prefer.strip() or None
     if separate:
         from .batch import process_batch
 
         return process_batch(
             pdf_bytes, client_list=client_list, dpi=dpi, ai_credentials=creds,
-            ai_prefer=prefer, on_progress=on_progress,
+            ai_prefer=prefer, on_progress=on_progress, options=opts,
         )
     return process_pdf(
         pdf_bytes,
@@ -146,6 +183,8 @@ def _run_pipeline(
         enable_ai=enable_ai,
         ai_prefer=prefer,
         ai_credentials=creds,
+        on_progress=on_progress,
+        options=opts,
     )
 
 
@@ -178,6 +217,7 @@ async def process_async(
     enable_ai: bool = Form(default=False, description="Allow AI fallback on low-confidence pages/letters"),
     ai_credentials: str = Form(default="", description="JSON bundle of AI provider creds (from MVOS org_integrations)"),
     ai_prefer: str = Form(default="", description="Preferred AI provider (e.g. 'openrouter')"),
+    options: str = Form(default="", description="Per-request override JSON: prompts/models/limits/match/split"),
     _: None = Security(_require_api_key),
 ) -> dict[str, Any]:
     """
@@ -191,10 +231,7 @@ async def process_async(
     with status='complete').
     """
     dpi = dpi or default_render_dpi()
-    _validate_upload(file, dpi)
-    pdf_bytes = await file.read()
-    if not pdf_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    pdf_bytes = await _read_upload(file, dpi)
 
     client_list = [c.strip() for c in clients.split(",") if c.strip()] if clients else None
     celery = _get_celery()
@@ -211,6 +248,7 @@ async def process_async(
             enable_ai=enable_ai,
             ai_credentials=ai_credentials,
             ai_prefer=ai_prefer,
+            options=options,
         )
         return {"job_id": task.id, "status": "pending"}
 
@@ -224,7 +262,7 @@ async def process_async(
         job_id,
         lambda cb: _run_pipeline(
             pdf_bytes, client_list, dpi, separate, enable_ai, ai_credentials, ai_prefer,
-            on_progress=cb,
+            options=options, on_progress=cb,
         ),
     )
     return {"job_id": job_id, "status": "processing"}
@@ -234,6 +272,7 @@ async def process_async(
 async def split_async(
     file: UploadFile = File(..., description="Batch PDF to split into letters"),
     dpi: int = Form(default=0, description="Render DPI — defaults to MAILSCAN_RENDER_DPI"),
+    options: str = Form(default="", description="Per-request override JSON: split thresholds"),
     _: None = Security(_require_api_key),
 ) -> dict[str, Any]:
     """
@@ -244,22 +283,23 @@ async def split_async(
 
     Async via Celery when REDIS_URL is set; otherwise via the in-process registry.
     """
-    _validate_upload(file, dpi or default_render_dpi())
-    pdf_bytes = await file.read()
-    if not pdf_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
     dpi_val = dpi or default_render_dpi()
+    pdf_bytes = await _read_upload(file, dpi_val)
 
     celery = _get_celery()
     if celery is not None:
         from .worker import split_batch_task
         pdf_b64 = base64.b64encode(pdf_bytes).decode()
-        task = split_batch_task.delay(pdf_b64, dpi=dpi_val)
+        task = split_batch_task.delay(pdf_b64, dpi=dpi_val, options=options)
         return {"job_id": task.id, "status": "pending"}
 
     from .batch import split_batch
+    opts = parse_json_object(options, "options")
     job_id = _new_inproc_job()
-    _run_inproc(job_id, lambda cb: split_batch(pdf_bytes, dpi=dpi_val, on_progress=cb))
+    _run_inproc(
+        job_id,
+        lambda cb: split_batch(pdf_bytes, dpi=dpi_val, on_progress=cb, options=opts),
+    )
     return {"job_id": job_id, "status": "processing"}
 
 
@@ -324,6 +364,7 @@ async def ai_letter(
     ocr_text: str = Form(..., description="Full OCR text of the letter pages (concatenated)"),
     ai_credentials: str = Form(default="", description="JSON bundle of AI provider creds"),
     ai_prefer: str = Form(default="openrouter", description="Preferred AI provider"),
+    options: str = Form(default="", description="Per-request override JSON: prompts/models/limits"),
     _: None = Security(_require_api_key),
 ) -> dict[str, Any]:
     """
@@ -333,25 +374,23 @@ async def ai_letter(
     Returns:
       { recipient_name: str|null, summary: {mail_type, sender, summary, action_required}|null }
     """
-    import json as _json
-
-    creds: dict = {}
-    if ai_credentials.strip():
-        try:
-            creds = _json.loads(ai_credentials)
-        except Exception:
-            pass
+    creds = parse_credentials(ai_credentials) or {}
+    opts = parse_json_object(options, "options") or {}
     prefer = ai_prefer.strip() or "openrouter"
 
     from .ai_fallback import ai_extract, ai_summarise
 
+    ctx = {"ocr_text": ocr_text, "credentials": creds, "options": opts}
+
+    # These are blocking network calls (retries × 90s timeout) — run them off the
+    # event loop or one slow provider freezes the whole service, /health included.
     extraction = None
     if creds.get("openrouter") or creds.get("textract"):
-        extraction = ai_extract(b"", {"ocr_text": ocr_text, "credentials": creds}, prefer=prefer)
+        extraction = await run_in_threadpool(ai_extract, b"", ctx, prefer=prefer)
 
     summary_obj = None
     if creds.get("openrouter"):
-        summary_obj = ai_summarise(ocr_text, {"credentials": creds})
+        summary_obj = await run_in_threadpool(ai_summarise, ocr_text, ctx)
 
     return {
         "recipient_name": extraction.recipient_name if extraction else None,
@@ -377,6 +416,7 @@ async def process_sync(
     enable_ai: bool = Form(default=False, description="Allow AI fallback on low-confidence pages/letters"),
     ai_credentials: str = Form(default="", description="JSON bundle of AI provider creds (from MVOS org_integrations)"),
     ai_prefer: str = Form(default="", description="Preferred AI provider (e.g. 'openrouter')"),
+    options: str = Form(default="", description="Per-request override JSON: prompts/models/limits/match/split"),
     _: None = Security(_require_api_key),
 ) -> dict[str, Any]:
     """
@@ -385,10 +425,7 @@ async def process_sync(
     May timeout on large PDFs — use POST /process + GET /jobs/{id} for production.
     """
     dpi = dpi or default_render_dpi()
-    _validate_upload(file, dpi)
-    pdf_bytes = await file.read()
-    if not pdf_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    pdf_bytes = await _read_upload(file, dpi)
 
     client_list = [c.strip() for c in clients.split(",") if c.strip()] if clients else None
 
@@ -397,7 +434,8 @@ async def process_sync(
     # checks included) until it finishes.
     try:
         result = await run_in_threadpool(
-            _run_pipeline, pdf_bytes, client_list, dpi, separate, enable_ai, ai_credentials, ai_prefer
+            _run_pipeline, pdf_bytes, client_list, dpi, separate, enable_ai,
+            ai_credentials, ai_prefer, options,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

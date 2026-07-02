@@ -124,13 +124,18 @@ def test_page_has_decision_and_recipient_fields():
     assert "ai" in page
 
 
-def test_assess_auto_on_individual_mailmark_postcode():
+def test_assess_individual_mailmark_postcode_needs_client_match():
     from app.pipeline import _assess_confidence
+    # A bare delivery postcode + name with NO client match must not AUTO — routing
+    # needs to know WHICH client (auto-ing on postcode alone routed to client=None).
     page = {
         "barcode_type": "mailmark", "postcode": "LU4 8DP", "ocr_text": "x" * 300,
         "recipient_name": "Mr T Choudhary", "recipient_confidence": 0.85, "match_score": None,
     }
-    assert _assess_confidence(page, None)["decision"] == "auto"
+    assert _assess_confidence(page, None)["decision"] == "ai"
+    # With a strong client match it does AUTO.
+    matched = {**page, "matched_client": "Mr T Choudhary", "match_score": 100.0}
+    assert _assess_confidence(matched, 100.0)["decision"] == "auto"
 
 
 def test_assess_shared_office_requires_client_match():
@@ -156,14 +161,23 @@ def test_assess_review_on_blank_page():
     assert _assess_confidence(page, None)["decision"] == "review"
 
 
-def test_ai_fallback_module_mock():
+def test_ai_fallback_module_mock(monkeypatch):
+    # The mock provider is OPT-IN — a silent mock in production could mis-route mail.
+    monkeypatch.setenv("MAILSCAN_AI_ENABLE_MOCK", "1")
     from app.ai_fallback import ai_extract, available_providers
     assert "mock" in available_providers()
     res = ai_extract(b"", {"ocr_text": "Acme Ltd\nLondon"})
     assert res is not None and res.provider == "mock"
 
 
-def test_ai_fallback_invoked_when_enabled():
+def test_mock_provider_off_by_default(monkeypatch):
+    monkeypatch.delenv("MAILSCAN_AI_ENABLE_MOCK", raising=False)
+    from app.ai_fallback import available_providers
+    assert "mock" not in available_providers()
+
+
+def test_ai_fallback_invoked_when_enabled(monkeypatch):
+    monkeypatch.setenv("MAILSCAN_AI_ENABLE_MOCK", "1")
     from app.pipeline import process_pdf
     # No barcode + multi-line body (insert_text does not wrap) → gate routes to
     # 'ai'; the mock provider is attempted.
@@ -171,3 +185,75 @@ def test_ai_fallback_invoked_when_enabled():
     page = process_pdf(_make_pdf(body), enable_ai=True)["pages"][0]
     assert page["ai"] is not None
     assert page["ai"]["provider"] == "mock"
+
+
+# --- Per-request options (tenant-override channel) --------------------------
+
+def test_options_override_prompts_models_limits():
+    from app.ai_fallback import (
+        DEFAULT_EXTRACT_PROMPT,
+        _openrouter_model,
+        _opt_int,
+        _opt_str,
+    )
+
+    ctx = {
+        "credentials": {"openrouter": {"api_key": "k", "model": "shared/model"}},
+        "options": {
+            "prompts": {"extract": "Custom extract prompt"},
+            "models": {"summary": "org/summary-model"},
+            "limits": {"extract_chars": 1234},
+        },
+    }
+    # prompt: per-request override wins; absent → default
+    assert _opt_str(ctx, "prompts", "extract") == "Custom extract prompt"
+    assert _opt_str(ctx, "prompts", "summary") is None
+    assert DEFAULT_EXTRACT_PROMPT  # default exists for the fallback path
+    # model: per-task override beats the shared creds model; extract falls back
+    assert _openrouter_model(ctx, task="summary") == ("k", "org/summary-model")
+    assert _openrouter_model(ctx, task="extract") == ("k", "shared/model")
+    # limits: valid override applies; invalid/absent → default
+    assert _opt_int(ctx, "limits", "extract_chars", 6000) == 1234
+    assert _opt_int(ctx, "limits", "summary_chars", 8000) == 8000
+    assert _opt_int({"options": {"limits": {"extract_chars": "junk"}}}, "limits", "extract_chars", 6000) == 6000
+
+
+def test_options_override_match_cutoff():
+    from app.pipeline import process_pdf
+
+    pdf = _make_pdf(
+        "Acme Industries Ltd\n14 High Street\nLuton LU1 1AA\n\nDear Sir, Please find enclosed..."
+    )
+    clients = ["Acme Industries Ltd", "Beta Corp"]
+
+    # Default cutoff matches this letter (see test_client_fuzzy_match)
+    assert process_pdf(pdf, client_list=clients)["pages"][0]["matched_client"] is not None
+    # An impossible per-request cutoff suppresses the match
+    strict = process_pdf(pdf, client_list=clients, options={"match": {"cutoff": 101}})
+    assert strict["pages"][0]["matched_client"] is None
+
+
+def test_options_shared_postcodes_override():
+    from app.pipeline import MatchSettings, _assess_confidence
+
+    page = {
+        "barcode_type": "mailmark", "postcode": "LU4 8DP", "ocr_text": "x" * 300,
+        "recipient_name": "Acme Ltd", "recipient_confidence": 0.85, "match_score": None,
+    }
+    default = _assess_confidence(page, None)
+    treated_shared = _assess_confidence(
+        page, None, MatchSettings({"match": {"shared_postcodes": ["LU4 8DP"]}})
+    )
+    # Both go to AI (no client match), but the shared-postcode reason changes
+    assert default["decision"] == treated_shared["decision"] == "ai"
+    assert any("Shared-office" in r for r in treated_shared["reasons"])
+    assert not any("Shared-office" in r for r in default["reasons"])
+
+
+def test_options_invalid_values_fall_back_to_defaults():
+    from app.pipeline import MatchSettings
+
+    s = MatchSettings({"match": {"cutoff": "junk", "shared_postcodes": "not-a-list"}})
+    d = MatchSettings(None)
+    assert s.cutoff == d.cutoff
+    assert s.shared_postcodes == d.shared_postcodes

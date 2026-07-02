@@ -24,15 +24,111 @@ context shape:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
 from typing import Optional
 
+logger = logging.getLogger("mailscan.ai")
+
 # UK postcode (lenient, optional space) for locating the address block.
 _PC_RE = re.compile(r"([A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2})")
+
+
+def parse_json_object(raw: str | None, label: str = "payload") -> dict | None:
+    """Parse a JSON-object form field. Returns None on empty/invalid input (never raises)."""
+    if not raw or not raw.strip():
+        return None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        logger.warning("%s is not valid JSON — ignoring", label)
+        return None
+    if not isinstance(parsed, dict):
+        logger.warning("%s is not a JSON object — ignoring", label)
+        return None
+    return parsed
+
+
+def parse_credentials(raw: str | None) -> dict | None:
+    """
+    Parse the AI-credentials bundle passed per-request (MVOS org_integrations) —
+    a JSON object string. Shared by the API layer, the Celery worker, and /ai/letter.
+    """
+    return parse_json_object(raw, "ai_credentials")
+
+
+# ---------------------------------------------------------------------------
+# Per-request options — the tenant-override channel.
+#
+# Callers (MVOS) pass an `options` JSON object alongside ai_credentials; every
+# value here overrides the server default for THIS request only, so each org can
+# run mailscan with its own prompts / models / thresholds without a redeploy:
+#   {
+#     "prompts": {"extract": str, "summary": str},   # full system-prompt overrides
+#     "models":  {"extract": str, "summary": str},   # per-task OpenRouter model
+#     "limits":  {"extract_chars": int, "summary_chars": int},
+#     "match":   {"cutoff": float, "margin": float, "name_conf": float,
+#                  "shared_postcodes": [str]},
+#     "split":   {"blank_ink_pct": float, "blank_keep_floor": float},
+#   }
+# Unknown keys are ignored (forward compatible). Providers read them from
+# context["options"].
+# ---------------------------------------------------------------------------
+
+def _options(context: dict | None) -> dict:
+    opts = (context or {}).get("options")
+    return opts if isinstance(opts, dict) else {}
+
+
+def _opt_str(context: dict | None, section: str, key: str) -> Optional[str]:
+    v = (_options(context).get(section) or {}).get(key)
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+
+def _opt_int(context: dict | None, section: str, key: str, default: int) -> int:
+    v = (_options(context).get(section) or {}).get(key)
+    try:
+        n = int(v)
+        return n if n > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+# Custom extraction prompt MUST keep the JSON contract below — the pipeline
+# parses these exact keys. Env overrides the default; per-request options
+# override both.
+DEFAULT_EXTRACT_PROMPT = os.environ.get("MAILSCAN_EXTRACT_PROMPT") or (
+    "You identify the DELIVERY RECIPIENT of a UK letter — the person or company "
+    "it is physically addressed to, NOT the sender or letterhead organisation. "
+    "Reply ONLY with JSON (no prose, no markdown): "
+    '{"company_name": string|null, '
+    '"individual_name": string|null, '
+    '"address_lines": string|null, '
+    '"postcode": string|null}. '
+    "company_name: registered business/organisation name (null for personal letters). "
+    "individual_name: personal name including title (null if only a company is named). "
+    "address_lines: street address excluding postcode, lines joined with \\n. "
+    "postcode: UK postcode of the delivery address. "
+    "Use null for any field that is genuinely absent."
+)
+
+DEFAULT_SUMMARY_PROMPT = os.environ.get("MAILSCAN_SUMMARY_PROMPT") or (
+    "You summarise a scanned UK letter for the recipient's virtual-mailroom "
+    "inbox — so they grasp it without opening the full scan. Return ONLY JSON: "
+    '{"mail_type": string, "sender": string, "summary": string (1-2 plain '
+    'sentences with the key point/action), "action_required": string|null, '
+    '"due_date": string|null, "reference": string|null, "amount": string|null}. '
+    "Be concise and factual; use null when a field is absent."
+)
+
+# Default truncation limits for the text handed to the LLM (chars).
+_EXTRACT_CHARS = int(os.environ.get("MAILSCAN_EXTRACT_CHARS", "6000"))
+_SUMMARY_CHARS = int(os.environ.get("MAILSCAN_SUMMARY_CHARS", "8000"))
 
 
 @dataclass
@@ -152,9 +248,20 @@ def _openrouter_chat(api_key: str, model: str, system: str, user: str, json_mode
             if content and content.strip():
                 return content.strip()
             last_err = RuntimeError("empty completion")
+        except urllib.error.HTTPError as e:
+            # Client errors other than rate-limit/timeout are permanent (bad key,
+            # bad model, malformed request) — retrying just burns latency.
+            if 400 <= e.code < 500 and e.code not in (408, 429):
+                logger.warning("openrouter %s: HTTP %s — not retryable", model, e.code)
+                raise
+            last_err = e
         except Exception as e:  # transient HTTP / network / parse — retry
             last_err = e
-        time.sleep(1.5 * (attempt + 1))
+        logger.warning(
+            "openrouter %s attempt %d/%d failed: %s", model, attempt + 1, retries, last_err
+        )
+        if attempt < retries - 1:
+            time.sleep(1.5 * (attempt + 1))
     raise last_err or RuntimeError("openrouter failed")
 
 
@@ -179,10 +286,16 @@ def _loose_json(s: str) -> Optional[dict]:
     return None
 
 
-def _openrouter_model(context: dict) -> tuple[Optional[str], str]:
+def _openrouter_model(context: dict, task: str = "extract") -> tuple[Optional[str], str]:
+    """API key + model for a task. Per-task options override the shared creds model."""
     c = _creds(context, "openrouter")
     api_key = c.get("api_key") or os.environ.get("OPENROUTER_API_KEY")
-    model = c.get("model") or os.environ.get("OPENROUTER_MODEL") or "deepseek/deepseek-chat"
+    model = (
+        _opt_str(context, "models", task)
+        or c.get("model")
+        or os.environ.get("OPENROUTER_MODEL")
+        or "deepseek/deepseek-chat"
+    )
     return api_key, model
 
 
@@ -198,27 +311,13 @@ class OpenRouterProvider(AIProvider):
         return bool(_openrouter_model(context)[0])
 
     def extract(self, image_png: bytes, context: dict) -> AIResult:
-        api_key, model = _openrouter_model(context)
+        api_key, model = _openrouter_model(context, task="extract")
         text = (context or {}).get("ocr_text", "") or ""
         if not api_key or not text.strip():
             raise NotImplementedError("no openrouter credentials/text")
-        out = _openrouter_chat(
-            api_key,
-            model,
-            "You identify the DELIVERY RECIPIENT of a UK letter — the person or company "
-            "it is physically addressed to, NOT the sender or letterhead organisation. "
-            "Reply ONLY with JSON (no prose, no markdown): "
-            '{"company_name": string|null, '
-            '"individual_name": string|null, '
-            '"address_lines": string|null, '
-            '"postcode": string|null}. '
-            "company_name: registered business/organisation name (null for personal letters). "
-            "individual_name: personal name including title (null if only a company is named). "
-            "address_lines: street address excluding postcode, lines joined with \\n. "
-            "postcode: UK postcode of the delivery address. "
-            "Use null for any field that is genuinely absent.",
-            text[:6000],
-        )
+        prompt = _opt_str(context, "prompts", "extract") or DEFAULT_EXTRACT_PROMPT
+        limit = _opt_int(context, "limits", "extract_chars", _EXTRACT_CHARS)
+        out = _openrouter_chat(api_key, model, prompt, text[:limit])
         data = _loose_json(out) or {}
         company = (data.get("company_name") or "").strip() or None
         individual = (data.get("individual_name") or "").strip() or None
@@ -243,23 +342,16 @@ def ai_summarise(text: str, context: dict | None = None) -> Optional[dict]:
     of structured fields, or None if unavailable. Never raises.
     """
     context = context or {}
-    api_key, model = _openrouter_model(context)
+    api_key, model = _openrouter_model(context, task="summary")
     if not api_key or not (text or "").strip():
         return None
+    prompt = _opt_str(context, "prompts", "summary") or DEFAULT_SUMMARY_PROMPT
+    limit = _opt_int(context, "limits", "summary_chars", _SUMMARY_CHARS)
     try:
-        out = _openrouter_chat(
-            api_key,
-            model,
-            "You summarise a scanned UK letter for the recipient's virtual-mailroom "
-            "inbox — so they grasp it without opening the full scan. Return ONLY JSON: "
-            '{"mail_type": string, "sender": string, "summary": string (1-2 plain '
-            'sentences with the key point/action), "action_required": string|null, '
-            '"due_date": string|null, "reference": string|null, "amount": string|null}. '
-            "Be concise and factual; use null when a field is absent.",
-            (text or "")[:8000],
-        )
+        out = _openrouter_chat(api_key, model, prompt, (text or "")[:limit])
         return _loose_json(out) or {"mail_type": "Letter", "summary": out[:400]}
     except Exception:
+        logger.warning("ai_summarise failed — letter will have no summary", exc_info=True)
         return None
 
 
@@ -275,11 +367,16 @@ class GeminiProvider(AIProvider):
 
 
 class MockProvider(AIProvider):
-    """No-key stand-in so the flow is testable before real keys exist."""
+    """
+    No-key stand-in so the flow is testable before real keys exist. OPT-IN
+    (MAILSCAN_AI_ENABLE_MOCK=1): in production a silent mock would return the
+    first OCR line as the "recipient" — a plausible-looking wrong answer that
+    could mis-route real mail when credentials are missing or misconfigured.
+    """
     name = "mock"
 
     def available(self, context: dict) -> bool:
-        return os.environ.get("MAILSCAN_AI_DISABLE_MOCK") != "1"
+        return os.environ.get("MAILSCAN_AI_ENABLE_MOCK") == "1"
 
     def extract(self, image_png: bytes, context: dict) -> AIResult:
         text = (context or {}).get("ocr_text", "") or ""
@@ -322,5 +419,6 @@ def ai_extract(
         except NotImplementedError:
             continue
         except Exception:
+            logger.warning("AI provider %s failed — trying next", provider.name, exc_info=True)
             continue
     return None

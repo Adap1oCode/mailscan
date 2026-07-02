@@ -186,7 +186,33 @@ Falls back to synchronous result if `REDIS_URL` is not configured.
 |-------|------|----------|---------|-------------|
 | `file` | PDF | Yes | — | Scanned letter(s) — single or multi-page |
 | `clients` | string | No | `""` | Comma-separated client names for fuzzy matching |
-| `dpi` | integer | No | `300` | Render DPI. Range 72–600. Higher = better OCR, slower. |
+| `dpi` | integer | No | `MAILSCAN_RENDER_DPI` (200) | Render DPI. Range 72–600. Higher = better OCR, slower. |
+| `separate` | bool | No | `false` | Split a multi-letter batch on MVOS-DOC-SEP → `documents[]` |
+| `enable_ai` | bool | No | `false` | Allow AI fallback on low-confidence pages/letters |
+| `ai_credentials` | JSON string | No | `""` | AI provider creds bundle (textract/openrouter/gemini) |
+| `ai_prefer` | string | No | `""` | Preferred AI provider name |
+| `options` | JSON string | No | `""` | **Per-request overrides** — see below |
+
+**`options` — the tenant-override channel.** Every value overrides the server
+default for this request only, so each caller/org can run mailscan with its own
+prompts, models, and thresholds. All keys optional; unknown keys ignored:
+
+```json
+{
+  "prompts": {
+    "extract": "custom recipient-extraction system prompt (must keep the JSON output contract)",
+    "summary": "custom letter-summary system prompt (must keep the JSON output contract)"
+  },
+  "models":  { "extract": "openrouter model id", "summary": "openrouter model id" },
+  "limits":  { "extract_chars": 6000, "summary_chars": 8000 },
+  "match":   { "cutoff": 85, "margin": 10, "name_conf": 0.6,
+               "shared_postcodes": ["LU1 2DW"] },
+  "split":   { "blank_ink_pct": 0.6, "blank_keep_floor": 0.1 }
+}
+```
+
+Accepted by `POST /process`, `POST /process/sync`, `POST /split` (split section
+only) and `POST /ai/letter` (prompts/models/limits).
 
 **Response 200 — async (Redis configured):**
 ```json
@@ -285,8 +311,18 @@ but existing fields will not be renamed or removed.
 | `MAILSCAN_API_KEY` | **Yes** | — | Shared secret for `X-API-Key` auth. Generate with `openssl rand -hex 32`. |
 | `TESSERACT_CMD` | Linux/Mac | — | Path to tesseract binary. Set to `/usr/bin/tesseract` automatically in Docker. |
 | `PORT` | No | `8000` | HTTP port. |
-| `REDIS_URL` | No | — | Redis connection string e.g. `redis://redis:6379/0`. Enables async job queue. Without this, `/process` runs synchronously. |
+| `REDIS_URL` | No | — | Redis connection string e.g. `redis://redis:6379/0`. Enables the Celery job queue. Without this, `/process` runs jobs on an in-process thread pool (same job_id/poll API). |
 | `ADDRESS_PARSER` | No | `regex` | Set to `libpostal` for ML-based noise-tolerant address parsing. Requires libpostal compiled in image. See `RESEARCH.md`. |
+| `MAILSCAN_MAX_UPLOAD_MB` | No | `100` | Reject uploads larger than this (HTTP 413). |
+| `MAILSCAN_MAX_PAGES` | No | `500` | Reject PDFs with more pages than this (HTTP 413). |
+| `MAILSCAN_JOBS_MAX` | No | `64` | Max jobs kept in the in-process registry (no-Redis mode). |
+| `MAILSCAN_JOB_TTL_SEC` | No | `3600` | Finished in-process job results expire after this many seconds. |
+| `MAILSCAN_AI_CONCURRENCY` | No | `4` | Letters enriched concurrently (AI tier-up + summary) in batch mode. |
+| `MAILSCAN_AI_ENABLE_MOCK` | No | `0` | Set `1` to enable the no-key mock AI provider (tests/demos only — never in production). |
+| `MAILSCAN_EXTRACT_PROMPT` | No | built-in | Server-default recipient-extraction prompt (per-request `options.prompts.extract` overrides). |
+| `MAILSCAN_SUMMARY_PROMPT` | No | built-in | Server-default letter-summary prompt (per-request `options.prompts.summary` overrides). |
+| `MAILSCAN_EXTRACT_CHARS` | No | `6000` | Max OCR chars sent to the extraction model. |
+| `MAILSCAN_SUMMARY_CHARS` | No | `8000` | Max OCR chars sent to the summary model. |
 
 Copy `.env.example` to `.env` and fill in `MAILSCAN_API_KEY` before starting.
 

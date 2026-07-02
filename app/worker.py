@@ -32,6 +32,7 @@ def process_pdf_task(
     enable_ai: bool = False,
     ai_credentials: str = "",
     ai_prefer: str = "",
+    options: str = "",
 ) -> dict:
     """
     Process a PDF scan asynchronously.
@@ -39,28 +40,24 @@ def process_pdf_task(
     With separate=true, splits a multi-letter batch and returns documents[].
     """
     import base64
-    import json as _json
+
+    from .ai_fallback import parse_credentials, parse_json_object
 
     self.update_state(state="PROCESSING")
     pdf_bytes = base64.b64decode(pdf_b64)
-    creds = None
-    if ai_credentials and ai_credentials.strip():
-        try:
-            parsed = _json.loads(ai_credentials)
-            creds = parsed if isinstance(parsed, dict) else None
-        except Exception:
-            creds = None
+    creds = parse_credentials(ai_credentials)
+    opts = parse_json_object(options, "options")
     prefer = ai_prefer.strip() or None
+
+    def _progress(step: str, current: int, total: int) -> None:
+        self.update_state(state="PROGRESS", meta={"step": step, "current": current, "total": total})
 
     if separate:
         from .batch import process_batch
 
-        def _progress(step: str, current: int, total: int) -> None:
-            self.update_state(state="PROGRESS", meta={"step": step, "current": current, "total": total})
-
         return process_batch(
             pdf_bytes, client_list=client_list, dpi=dpi, ai_credentials=creds, ai_prefer=prefer,
-            on_progress=_progress,
+            on_progress=_progress, options=opts,
         )
     from .pipeline import process_pdf
 
@@ -71,17 +68,21 @@ def process_pdf_task(
         enable_ai=enable_ai,
         ai_prefer=prefer,
         ai_credentials=creds,
+        on_progress=_progress,
+        options=opts,
     )
 
 
 @celery_app.task(bind=True, name="mailscan.split_batch")
-def split_batch_task(self, pdf_b64: str, dpi: int = 0) -> dict:
+def split_batch_task(self, pdf_b64: str, dpi: int = 0, options: str = "") -> dict:
     """
     Split-only batch separation (no OCR/barcode/match/AI) — the fast first step.
     Reports PROGRESS state as ("scan", page, total) then ("split", letter, total)
     so the poller can show a live "page N of M" / "letter N of M" indicator.
     """
     import base64
+
+    from .ai_fallback import parse_json_object
 
     self.update_state(state="PROCESSING")
     pdf_bytes = base64.b64decode(pdf_b64)
@@ -91,4 +92,7 @@ def split_batch_task(self, pdf_b64: str, dpi: int = 0) -> dict:
     def _progress(step: str, current: int, total: int) -> None:
         self.update_state(state="PROGRESS", meta={"step": step, "current": current, "total": total})
 
-    return split_batch(pdf_bytes, dpi=dpi or None, on_progress=_progress)
+    return split_batch(
+        pdf_bytes, dpi=dpi or None, on_progress=_progress,
+        options=parse_json_object(options, "options"),
+    )

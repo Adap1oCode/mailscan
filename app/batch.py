@@ -5,19 +5,25 @@ This is the production version of scans/run_e2e_new.py: it does the whole
 engine-side job in one call so MVOS can ingest the result letter-by-letter.
 
 Pipeline per batch:
-  1. free stack over every page (Tesseract hOCR + barcode + localise + match)
-  2. SPLIT deterministically on MVOS-DOC-SEP separator sheets (center-crop decode,
-     reliable where the incidental full-page decode is not), dropping blank backs
+  1. SPLIT first — one cheap grayscale pass (ink coverage + centre-crop decode of
+     MVOS-DOC-SEP separator sheets). Deterministic, no OCR. Separator sheets and
+     blank duplex backs are identified here and never OCR'd at all.
+  2. free stack over CONTENT pages only (Tesseract hOCR + barcode + localise + match)
   3. per letter: if the free stack isn't confident, tier up — AWS Textract on the
      carrier image, then DeepSeek (OpenRouter) on the combined text
   4. per letter: a DeepSeek client-facing summary
+  Steps 3–4 run across letters on a small thread pool — the AI calls are
+  network-bound, so N letters no longer cost N sequential round-trips.
 
 Returns {page_count, documents:[...]} — one entry per letter, ready for MVOS to map
 into a mail_items ingest. mailscan stays credential-free: AI creds are passed in.
 """
 from __future__ import annotations
 
+import logging
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional
 
 import fitz  # PyMuPDF
@@ -26,14 +32,15 @@ from PIL import Image
 from pylibdmtx.pylibdmtx import decode as dmtx_decode
 
 from .ai_fallback import ai_extract, ai_summarise
-from .pipeline import _match_clients, default_render_dpi, process_pdf
+from .pipeline import MatchSettings, _match_clients, default_render_dpi, process_pdf
+
+logger = logging.getLogger("mailscan.batch")
 
 SEP_TOKEN = "MVOS-DOC-SEP"
-_BLANK_OCR_LEN = 20  # a page with < this many OCR chars is a blank duplex back
 
 # Ink coverage (% of dark pixels) below which a page is treated as blank — a
 # duplex back, or the blank back of a single-sided separator sheet. Pixel-based,
-# so it works WITHOUT OCR (the split-only path runs no Tesseract). Configurable.
+# so it works WITHOUT OCR (the split pass runs no Tesseract). Configurable.
 _BLANK_INK_PCT = float(os.environ.get("MAILSCAN_BLANK_INK_PCT", "0.6"))
 
 # Timeout (ms) for the centre-crop separator-barcode decode. A separator that IS
@@ -49,60 +56,46 @@ _SEP_DECODE_TIMEOUT_MS = int(os.environ.get("MAILSCAN_SEP_DECODE_TIMEOUT_MS", "2
 # stays below it and is correctly dropped. Must be < _BLANK_INK_PCT.
 _BLANK_KEEP_FLOOR = float(os.environ.get("MAILSCAN_BLANK_KEEP_FLOOR", "0.1"))
 
+# How many letters run their AI tier-up + summary concurrently. The calls are
+# network-bound (OpenRouter/Textract round-trips), so a small pool collapses the
+# dominant wall-clock cost of a big batch without hammering the providers.
+_AI_CONCURRENCY = int(os.environ.get("MAILSCAN_AI_CONCURRENCY", "4"))
 
-def _detect_separators(pdf_bytes: bytes, dpi: int = 150) -> set[int]:
-    """Reliably find separator sheets by decoding the centre Data Matrix.
 
-    The full-page barcode decode in pipeline.py misses these at 300 DPI; a
-    centre-crop at a modest DPI decodes every MVOS-DOC-SEP sheet. Cheap — runs at
-    150 DPI and only attempts a decode on light (separator/blank-ish) pages.
+def _split_thresholds(options: dict | None) -> tuple[float, float]:
+    """Blank-page thresholds — per-request options["split"] override the env defaults."""
+    s = (options or {}).get("split") or {}
+
+    def num(v: object, default: float) -> float:
+        try:
+            return float(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return default
+
+    return (
+        num(s.get("blank_ink_pct"), _BLANK_INK_PCT),
+        num(s.get("blank_keep_floor"), _BLANK_KEEP_FLOOR),
+    )
+
+
+def _is_separator_page(img: np.ndarray, ink_pct: float) -> bool:
     """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    seps: set[int] = set()
+    Detect an MVOS-DOC-SEP separator sheet on a rendered grayscale page.
+
+    Separator sheets carry only a small centred Data Matrix → low-but-nonzero ink;
+    only pages in that band are worth a decode attempt (cheap centre crop — the
+    full-page decode in pipeline.py misses these at 300 DPI, the crop never does).
+    """
+    if not (0.5 < ink_pct < 12):
+        return False
+    h, w = img.shape
+    crop = Image.fromarray(img[int(h * 0.28):int(h * 0.62), int(w * 0.30):int(w * 0.70)])
     try:
-        for i in range(doc.page_count):
-            pix = doc[i].get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
-            ink = float((img < 128).mean()) * 100.0
-            if not (0.5 < ink < 12):
-                continue
-            h, w = img.shape
-            crop = Image.fromarray(img[int(h * 0.28):int(h * 0.62), int(w * 0.30):int(w * 0.70)])
-            try:
-                res = dmtx_decode(crop, timeout=_SEP_DECODE_TIMEOUT_MS, max_count=1)
-                if res and SEP_TOKEN in res[0].data.decode("ascii", "ignore"):
-                    seps.add(i + 1)
-            except Exception:
-                pass
-    finally:
-        doc.close()
-    return seps
-
-
-def _carrier_png(pdf_bytes: bytes, page_1based: int, dpi: int = 300) -> bytes:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        return doc[page_1based - 1].get_pixmap(dpi=dpi).tobytes("png")
-    finally:
-        doc.close()
-
-
-def _group_documents(pages: dict[int, dict], separators: set[int]) -> list[list[int]]:
-    """Content pages between separators form a document; blanks/separators dropped."""
-    docs: list[list[int]] = []
-    cur: list[int] = []
-    for n in sorted(pages):
-        if n in separators:
-            if cur:
-                docs.append(cur)
-                cur = []
-            continue
-        if len((pages[n].get("ocr_text") or "").strip()) < _BLANK_OCR_LEN:
-            continue
-        cur.append(n)
-    if cur:
-        docs.append(cur)
-    return docs
+        res = dmtx_decode(crop, timeout=_SEP_DECODE_TIMEOUT_MS, max_count=1)
+        return bool(res and SEP_TOKEN in res[0].data.decode("ascii", "ignore"))
+    except Exception:
+        logger.warning("separator decode failed on a candidate page", exc_info=True)
+        return False
 
 
 def _scan_pages(
@@ -111,10 +104,10 @@ def _scan_pages(
     on_progress: Optional[Callable[[str, int, int], None]] = None,
 ) -> tuple[int, dict[int, float], set[int]]:
     """
-    Single render pass over the batch for the SPLIT-ONLY path — no OCR, no
-    full-page barcode scan. For each page it computes ink coverage (% dark pixels)
-    and, on light pages, attempts the cheap centre-crop Data Matrix decode to find
-    MVOS-DOC-SEP separator sheets.
+    Single grayscale render pass over the batch — no OCR, no full-page barcode
+    scan. For each page it computes ink coverage (% dark pixels) and, on light
+    pages, attempts the cheap centre-crop Data Matrix decode to find MVOS-DOC-SEP
+    separator sheets.
 
     Returns (page_count, ink_pct_by_page_1based, separator_pages_1based).
     Reports progress as ("scan", page_index, page_count).
@@ -131,19 +124,8 @@ def _scan_pages(
             img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
             ink = float((img < 128).mean()) * 100.0
             ink_by_page[i + 1] = ink
-            # Separator sheets carry only a small centred barcode → low-but-nonzero
-            # ink. Only those pages are worth a decode attempt (cheap centre crop).
-            if 0.5 < ink < 12:
-                h, w = img.shape
-                crop = Image.fromarray(
-                    img[int(h * 0.28):int(h * 0.62), int(w * 0.30):int(w * 0.70)]
-                )
-                try:
-                    res = dmtx_decode(crop, timeout=_SEP_DECODE_TIMEOUT_MS, max_count=1)
-                    if res and SEP_TOKEN in res[0].data.decode("ascii", "ignore"):
-                        seps.add(i + 1)
-                except Exception:
-                    pass
+            if _is_separator_page(img, ink):
+                seps.add(i + 1)
         if on_progress:
             on_progress("scan", total, total)
     finally:
@@ -152,7 +134,11 @@ def _scan_pages(
 
 
 def _group_split(
-    page_count: int, ink_by_page: dict[int, float], separators: set[int]
+    page_count: int,
+    ink_by_page: dict[int, float],
+    separators: set[int],
+    blank_ink_pct: float | None = None,
+    blank_keep_floor: float | None = None,
 ) -> list[list[int]]:
     """
     Group content pages into letters using ONLY separator positions + ink coverage
@@ -179,14 +165,16 @@ def _group_split(
         segments.append(cur)
 
     # 2. per segment, keep non-blank pages; salvage faint single-page letters
+    ink_min = blank_ink_pct if blank_ink_pct is not None else _BLANK_INK_PCT
+    keep_floor = blank_keep_floor if blank_keep_floor is not None else _BLANK_KEEP_FLOOR
     docs: list[list[int]] = []
     for seg in segments:
-        kept = [n for n in seg if ink_by_page.get(n, 100.0) >= _BLANK_INK_PCT]
+        kept = [n for n in seg if ink_by_page.get(n, 100.0) >= ink_min]
         if kept:
             docs.append(kept)
             continue
         densest = max(seg, key=lambda n: ink_by_page.get(n, 0.0))
-        if ink_by_page.get(densest, 0.0) >= _BLANK_KEEP_FLOOR:
+        if ink_by_page.get(densest, 0.0) >= keep_floor:
             docs.append([densest])  # faint letter — not a true blank
     return docs
 
@@ -195,6 +183,7 @@ def split_batch(
     pdf_bytes: bytes,
     dpi: Optional[int] = None,
     on_progress: Optional[Callable[[str, int, int], None]] = None,
+    options: Optional[dict] = None,
 ) -> dict[str, Any]:
     """
     FAST split-only pass: separate a multi-letter batch into per-letter page groups
@@ -210,8 +199,9 @@ def split_batch(
     if not dpi or dpi <= 0:
         dpi = default_render_dpi()
 
+    blank_ink_pct, blank_keep_floor = _split_thresholds(options)
     page_count, ink_by_page, separators = _scan_pages(pdf_bytes, dpi, on_progress)
-    groups = _group_split(page_count, ink_by_page, separators)
+    groups = _group_split(page_count, ink_by_page, separators, blank_ink_pct, blank_keep_floor)
 
     documents: list[dict[str, Any]] = []
     total_letters = len(groups)
@@ -245,6 +235,66 @@ def split_batch(
     }
 
 
+def _render_carrier_pngs(pdf_bytes: bytes, pages_1based: set[int], dpi: int) -> dict[int, bytes]:
+    """Render the requested pages as PNG in ONE document open (for Textract)."""
+    if not pages_1based:
+        return {}
+    out: dict[int, bytes] = {}
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        for n in sorted(pages_1based):
+            out[n] = doc[n - 1].get_pixmap(dpi=dpi).tobytes("png")
+    finally:
+        doc.close()
+    return out
+
+
+def _enrich_letter(
+    rec: dict[str, Any],
+    combined_text: str,
+    carrier_png: bytes | None,
+    carrier_ocr_text: str,
+    client_list: Optional[list[str]],
+    creds: dict,
+    options: Optional[dict] = None,
+) -> None:
+    """
+    AI tier-up + summary for ONE letter (mutates rec in place). Runs on the
+    letter pool — must not touch shared mutable state beyond rec.
+    """
+    has_textract = bool(creds.get("textract"))
+    has_openrouter = bool(creds.get("openrouter"))
+    settings = MatchSettings(options)
+    ctx_base = {"credentials": creds, "options": options or {}}
+
+    # tier up only when the free stack wasn't confident
+    if rec["decision"] != "auto":
+        if has_textract and carrier_png:
+            ai = ai_extract(
+                carrier_png,
+                {**ctx_base, "ocr_text": carrier_ocr_text},
+                prefer="textract",
+            )
+            if ai:
+                rec["recipient_name"] = ai.recipient_name or rec["recipient_name"]
+                if ai.address:
+                    c2, s2, _ = _match_clients(ai.address, client_list, cutoff=settings.cutoff)
+                    if c2:
+                        rec.update(tier="aws", decision="auto", matched_client=c2, match_score=s2)
+        if rec["decision"] != "auto" and has_openrouter:
+            ai3 = ai_extract(b"", {**ctx_base, "ocr_text": combined_text}, prefer="openrouter")
+            if ai3 and ai3.recipient_name:
+                rec["recipient_name"] = ai3.recipient_name
+                c3, s3, _ = _match_clients(ai3.recipient_name, client_list, cutoff=settings.cutoff)
+                if c3:
+                    rec.update(tier="deepseek", decision="auto", matched_client=c3, match_score=s3)
+                else:
+                    rec["tier"] = rec["tier"] or "deepseek-extract"
+
+    # client-facing summary
+    rec["summary"] = ai_summarise(combined_text, ctx_base) if has_openrouter else None
+
+
 def process_batch(
     pdf_bytes: bytes,
     client_list: Optional[list[str]] = None,
@@ -252,29 +302,40 @@ def process_batch(
     ai_credentials: Optional[dict] = None,
     ai_prefer: Optional[str] = None,
     on_progress: Optional[Callable[[str, int, int], None]] = None,
+    options: Optional[dict] = None,
 ) -> dict[str, Any]:
-    """Separate a batch into letters with tiered extraction + summary."""
+    """
+    Separate a batch into letters with tiered extraction + summary.
+
+    Progress steps: ("scan", page, total) → ("ocr", page, content_total) →
+    ("ai", letter, letter_total).
+    """
     creds = ai_credentials or {}
-    has_textract = bool(creds.get("textract"))
-    has_openrouter = bool(creds.get("openrouter"))
+    if not dpi or dpi <= 0:
+        dpi = default_render_dpi()
 
-    # 1. free stack over the whole batch (no AI yet — cheaper, per-letter AI below)
-    if on_progress:
-        on_progress("ocr", 0, 1)
-    base = process_pdf(pdf_bytes, client_list=client_list, dpi=dpi, enable_ai=False)
+    # 1. split FIRST (cheap ink/separator scan) so separator sheets and blank
+    # backs are never rendered at full quality, OCR'd, or barcode-scanned at all.
+    blank_ink_pct, blank_keep_floor = _split_thresholds(options)
+    page_count, ink_by_page, separators = _scan_pages(pdf_bytes, dpi, on_progress)
+    groups = _group_split(page_count, ink_by_page, separators, blank_ink_pct, blank_keep_floor)
+    content_pages = sorted(n for g in groups for n in g)
+
+    # 2. free stack over content pages only (no AI yet — per-letter AI below)
+    base = process_pdf(
+        pdf_bytes,
+        client_list=client_list,
+        dpi=dpi,
+        enable_ai=False,
+        page_numbers=content_pages,
+        on_progress=on_progress,
+        options=options,
+    )
     pages = {p["page"]: p for p in base["pages"]}
-    if on_progress:
-        on_progress("ocr", 1, 1)
 
-    # 2. deterministic split
-    separators = _detect_separators(pdf_bytes)
-    groups = _group_documents(pages, separators)
-
-    documents: list[dict[str, Any]] = []
-    total_letters = len(groups)
+    # 3. per-letter records from the free-stack signals
+    letters: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
     for did, pgs in enumerate(groups, start=1):
-        if on_progress:
-            on_progress("ai", did - 1, total_letters)
         carrier = next(
             (pages[n] for n in pgs if pages[n]["barcode_type"] == "mailmark"),
             pages[pgs[0]],
@@ -292,37 +353,49 @@ def process_batch(
             "match_score": carrier.get("match_score"),
             "decision": carrier["decision"],
             "tier": "own" if carrier["decision"] == "auto" else None,
+            "summary": None,
+            "ocr": [{"page": n, "text": pages[n]["ocr_text"]} for n in pgs],
         }
+        letters.append((rec, combined, carrier))
 
-        # 3. tier up only when the free stack wasn't confident
-        if carrier["decision"] != "auto":
-            if has_textract:
-                ai = ai_extract(
-                    _carrier_png(pdf_bytes, carrier["page"], dpi),
-                    {"ocr_text": carrier["ocr_text"], "credentials": creds},
-                    prefer="textract",
-                )
-                if ai:
-                    rec["recipient_name"] = ai.recipient_name or rec["recipient_name"]
-                    if ai.address:
-                        c2, s2, _ = _match_clients(ai.address, client_list)
-                        if c2:
-                            rec.update(tier="aws", decision="auto", matched_client=c2, match_score=s2)
-            if rec["decision"] != "auto" and has_openrouter:
-                ai3 = ai_extract(b"", {"ocr_text": combined, "credentials": creds}, prefer="openrouter")
-                if ai3 and ai3.recipient_name:
-                    rec["recipient_name"] = ai3.recipient_name
-                    c3, s3, _ = _match_clients(ai3.recipient_name, client_list)
-                    if c3:
-                        rec.update(tier="deepseek", decision="auto", matched_client=c3, match_score=s3)
-                    else:
-                        rec["tier"] = rec["tier"] or "deepseek-extract"
+    # 4. carrier PNGs for the Textract tier — rendered in one document open, only
+    # for letters that can actually reach that tier.
+    carrier_pngs: dict[int, bytes] = {}
+    if creds.get("textract"):
+        need = {carrier["page"] for rec, _, carrier in letters if rec["decision"] != "auto"}
+        carrier_pngs = _render_carrier_pngs(pdf_bytes, need, dpi)
 
-        # 4. client-facing summary
-        rec["summary"] = ai_summarise(combined, {"credentials": creds}) if has_openrouter else None
-        rec["ocr"] = [{"page": n, "text": pages[n]["ocr_text"]} for n in pgs]
-        documents.append(rec)
+    # 5. AI tier-up + summary across letters on a small pool — the calls are
+    # network-bound, so this collapses N sequential round-trips into ~N/pool.
+    total_letters = len(letters)
+    if on_progress:
+        on_progress("ai", 0, total_letters)
+    done = 0
+    done_lock = threading.Lock()
+
+    def _work(item: tuple[dict[str, Any], str, dict[str, Any]]) -> None:
+        nonlocal done
+        rec, combined, carrier = item
+        try:
+            _enrich_letter(
+                rec, combined, carrier_pngs.get(carrier["page"]), carrier["ocr_text"],
+                client_list, creds, options,
+            )
+        except Exception:
+            # A failed enrichment must not sink the batch — the letter keeps its
+            # free-stack fields and falls to review/AI downstream.
+            logger.warning("AI enrichment failed for letter %s", rec["doc"], exc_info=True)
         if on_progress:
-            on_progress("ai", did, total_letters)
+            with done_lock:
+                done += 1
+                on_progress("ai", done, total_letters)
 
-    return {"page_count": base["page_count"], "separators": sorted(separators), "documents": documents}
+    if creds.get("textract") or creds.get("openrouter"):
+        with ThreadPoolExecutor(max_workers=max(1, _AI_CONCURRENCY)) as pool:
+            list(pool.map(_work, letters))
+    else:
+        for item in letters:
+            _work(item)
+
+    documents = [rec for rec, _, _ in letters]
+    return {"page_count": page_count, "separators": sorted(separators), "documents": documents}
