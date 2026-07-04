@@ -242,6 +242,8 @@ def split_batch(
                 "recipient_individual": None,
                 "recipient_address": None,
                 "recipient_postcode": None,
+                "recipient_company_number": None,
+                "recipient_vat_number": None,
                 "ocr": [],
             }
         )
@@ -300,6 +302,10 @@ def _enrich_letter(
             rec["recipient_address"] = ai_res.address
         if ai_res.postcode:
             rec["recipient_postcode"] = ai_res.postcode
+        if getattr(ai_res, "company_number", None):
+            rec["recipient_company_number"] = ai_res.company_number
+        if getattr(ai_res, "vat_number", None):
+            rec["recipient_vat_number"] = ai_res.vat_number
 
     # tier up only when the free stack wasn't confident
     if rec["decision"] != "auto":
@@ -399,6 +405,8 @@ def process_batch(
             "recipient_individual": None,
             "recipient_address": None,
             "recipient_postcode": None,
+            "recipient_company_number": None,
+            "recipient_vat_number": None,
             "ocr": [{"page": n, "text": pages[n]["ocr_text"]} for n in pgs],
         }
         letters.append((rec, combined, carrier))

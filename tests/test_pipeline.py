@@ -255,6 +255,28 @@ def test_summarise_letter_reports_provider_error(monkeypatch):
     assert error is not None and "RuntimeError" in error
 
 
+def test_extract_prompt_and_parse_carry_recipient_identifiers(monkeypatch):
+    # The JSON contract includes the recipient-side unique identifiers, with
+    # never-the-sender guidance, and the provider parses them onto AIResult.
+    import app.ai_fallback as af
+
+    assert '"company_number"' in af.DEFAULT_EXTRACT_PROMPT
+    assert '"vat_number"' in af.DEFAULT_EXTRACT_PROMPT
+    assert "NEVER the" in af.DEFAULT_EXTRACT_PROMPT  # sender-number guard wording
+
+    monkeypatch.setattr(
+        af, "_openrouter_chat",
+        lambda *a, **k: '{"company_name": "Acme Ltd", "individual_name": null,'
+        ' "address_lines": "1 High St", "postcode": "LU1 2DW",'
+        ' "company_number": "14130864", "vat_number": "GB123456789"}',
+    )
+    res = af.OpenRouterProvider().extract(
+        b"", {"ocr_text": "letter", "credentials": {"openrouter": {"api_key": "k"}}},
+    )
+    assert res.company_number == "14130864"
+    assert res.vat_number == "GB123456789"
+
+
 def test_ai_summarise_shim_returns_dict_only(monkeypatch):
     import app.ai_fallback as af
 

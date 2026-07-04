@@ -25,7 +25,7 @@ from .pipeline import default_render_dpi, pdf_page_count, process_pdf
 
 logger = logging.getLogger("mailscan.api")
 
-APP_VERSION = "2.2.0"  # + summary_error: distinguish provider failure from empty summary
+APP_VERSION = "2.3.0"  # + recipient company_number / vat_number extraction (deterministic matching keys)
 
 app = FastAPI(
     title="Mailscan",
@@ -410,6 +410,8 @@ async def ai_letter(
         "individual_name": extraction.individual_name if extraction else None,
         "address_lines": extraction.address if extraction else None,
         "postcode": extraction.postcode if extraction else None,
+        "company_number": extraction.company_number if extraction else None,
+        "vat_number": extraction.vat_number if extraction else None,
         "summary": {
             "mail_type": summary_obj.get("mail_type"),
             "sender": summary_obj.get("sender"),

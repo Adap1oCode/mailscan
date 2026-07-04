@@ -114,11 +114,20 @@ DEFAULT_EXTRACT_PROMPT = os.environ.get("MAILSCAN_EXTRACT_PROMPT") or (
     '{"company_name": string|null, '
     '"individual_name": string|null, '
     '"address_lines": string|null, '
-    '"postcode": string|null}. '
+    '"postcode": string|null, '
+    '"company_number": string|null, '
+    '"vat_number": string|null}. '
     "company_name: registered business/organisation name (null for personal letters). "
     "individual_name: personal name including title (null if only a company is named). "
     "address_lines: street address excluding postcode, lines joined with \\n. "
     "postcode: UK postcode of the delivery address. "
+    "company_number: the RECIPIENT company's Companies House registration number "
+    "when the letter quotes it ABOUT the recipient (e.g. 'Company number' beside "
+    "their name/reference on Companies House or HMRC letters) — NEVER the "
+    "sender's own registration number from the letterhead or small-print footer. "
+    "vat_number: the RECIPIENT's VAT registration number when the letter is "
+    "about their VAT affairs — NEVER the sender's/supplier's VAT number printed "
+    "on an invoice. "
     "Use null for any field that is genuinely absent."
 )
 
@@ -165,6 +174,10 @@ class AIResult:
     individual_name: Optional[str] = None  # personal name (title + surname etc.)
     address: Optional[str] = None          # street address lines (no postcode)
     postcode: Optional[str] = None
+    # Recipient-side unique identifiers when the letter quotes them (never the
+    # sender's own numbers) — deterministic matching keys downstream.
+    company_number: Optional[str] = None
+    vat_number: Optional[str] = None
     is_continuation: Optional[bool] = None
     confidence: float = 0.0
     provider: str = "none"
@@ -362,6 +375,8 @@ class OpenRouterProvider(AIProvider):
         individual = (data.get("individual_name") or "").strip() or None
         address_lines = (data.get("address_lines") or "").strip() or None
         postcode = (data.get("postcode") or "").strip() or None
+        company_number = (str(data.get("company_number") or "")).strip() or None
+        vat_number = (str(data.get("vat_number") or "")).strip() or None
         # Best display label: company if present, else individual
         recipient_name = company or individual
         return AIResult(
@@ -370,6 +385,8 @@ class OpenRouterProvider(AIProvider):
             individual_name=individual,
             address=address_lines,
             postcode=postcode,
+            company_number=company_number,
+            vat_number=vat_number,
             confidence=0.85 if recipient_name else 0.3,
             provider=f"openrouter:{model}",
         )
