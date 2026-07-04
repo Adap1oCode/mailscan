@@ -209,38 +209,107 @@ def _ocr_with_hocr(img: np.ndarray) -> tuple[str, list[dict]]:
     Uses pytesseract's hOCR output (image_to_pdf_or_hocr) for the boxes — this only
     needs the Tesseract binary, NOT ocrmypdf. Falls back to plain image_to_string
     only if hOCR parsing yields nothing.
+
+    PSM 3 (full automatic layout analysis) is deliberate: UK letters put the
+    recipient address and a sender reference panel SIDE BY SIDE, and PSM 6
+    ("one uniform block") reads straight across both, splicing them into the
+    same line ("Eco Pressure Pro Limited Company number: 23-27 King Street
+    14130864"). PSM 3 returns each block as its own hOCR area in reading
+    order, and the text is rebuilt line by line with real newlines — so
+    downstream consumers (the LLM summary, the search index, the recipient
+    heuristic) see coherent blocks, not interleaved columns.
     """
     pil = Image.fromarray(img)
     try:
-        hocr_bytes = pytesseract.image_to_pdf_or_hocr(pil, extension="hocr", config="--psm 6")
-        words = _parse_hocr(hocr_bytes)
+        hocr_bytes = pytesseract.image_to_pdf_or_hocr(pil, extension="hocr", config="--psm 3")
+        full_text, words = _parse_hocr(hocr_bytes)
         if words:
-            full_text = " ".join(w["text"] for w in words if w["text"].strip())
+            recovered = _recover_missed_amounts(pil, full_text)
+            if recovered:
+                full_text = full_text + "\n" + "\n".join(recovered)
             return full_text, words
     except Exception:
         logger.warning("hOCR pass failed — falling back to plain OCR (no word boxes)", exc_info=True)
-    return pytesseract.image_to_string(pil, config="--psm 6"), []
+    return pytesseract.image_to_string(pil, config="--psm 3"), []
 
 
-def _parse_hocr(hocr_bytes: bytes) -> list[dict]:
-    """Extract word bounding boxes from hOCR XML output."""
-    words = []
+_MONEY_RE = re.compile(r"£\s*\d[\d,.\s]*")
+
+
+def _recover_missed_amounts(pil: Image.Image, main_text: str) -> list[str]:
+    """
+    PSM 3's layout analysis occasionally classifies a boxed/shaded figure (a
+    bank letter's TOTAL cell, a payment slip amount) as a graphic and drops it
+    entirely — money we can never afford to lose silently. Run a sparse-text
+    pass (PSM 11: find text anywhere, no layout assumptions) and return any
+    £-amount lines whose digits are absent from the main text. Costs a second
+    OCR pass per page — accepted: completeness of captured amounts outranks
+    OCR latency for this pipeline.
+    """
+    try:
+        sparse = pytesseract.image_to_string(pil, config="--psm 11")
+    except Exception:
+        return []
+    main_digits = re.sub(r"\D", "", main_text)
+    out: list[str] = []
+    for ln in sparse.splitlines():
+        if "£" not in ln:
+            continue
+        for tok in _MONEY_RE.findall(ln):
+            digits = re.sub(r"\D", "", tok)
+            if len(digits) >= 3 and digits not in main_digits:
+                line = ln.strip()
+                if line not in out:
+                    out.append(line)
+                break
+    return out
+
+
+# hOCR line-level classes (ocr_line + its header/caption/float variants).
+_HOCR_LINE_CLASSES = ("ocr_line", "ocr_header", "ocr_caption", "ocr_textfloat")
+
+
+def _parse_hocr(hocr_bytes: bytes) -> tuple[str, list[dict]]:
+    """
+    Parse hOCR XML into (full_text, word_list).
+
+    full_text preserves Tesseract's layout analysis: one text line per hOCR
+    line element, blank line between blocks (ocr_carea) — instead of the old
+    flat space-join of every word on the page.
+    """
+    words: list[dict] = []
+    text_lines: list[str] = []
     try:
         root = ET.fromstring(hocr_bytes.decode("utf-8", errors="replace"))
-        ns = {"html": "http://www.w3.org/1999/xhtml"}
 
-        for elem in root.iter():
+        def _walk(elem: ET.Element) -> None:
             cls = elem.get("class", "")
-            if "ocrx_word" not in cls and "ocr_word" not in cls:
-                continue
-            title = elem.get("title", "")
-            bbox_match = re.search(r"bbox (\d+) (\d+) (\d+) (\d+)", title)
-            if bbox_match and elem.text:
-                x0, y0, x1, y1 = map(int, bbox_match.groups())
-                words.append({"text": elem.text.strip(), "x0": x0, "y0": y0, "x1": x1, "y1": y1})
+            if any(c in cls for c in _HOCR_LINE_CLASSES):
+                line_words: list[str] = []
+                for w in elem.iter():
+                    wcls = w.get("class", "")
+                    if "ocrx_word" not in wcls and "ocr_word" not in wcls:
+                        continue
+                    title = w.get("title", "")
+                    bbox_match = re.search(r"bbox (\d+) (\d+) (\d+) (\d+)", title)
+                    if bbox_match and w.text and w.text.strip():
+                        x0, y0, x1, y1 = map(int, bbox_match.groups())
+                        words.append({"text": w.text.strip(), "x0": x0, "y0": y0, "x1": x1, "y1": y1})
+                        line_words.append(w.text.strip())
+                if line_words:
+                    text_lines.append(" ".join(line_words))
+                return  # words consumed; don't descend further
+            if "ocr_carea" in cls and text_lines and text_lines[-1] != "":
+                text_lines.append("")  # blank line between layout blocks
+            for child in elem:
+                _walk(child)
+
+        _walk(root)
     except ET.ParseError:
         pass
-    return words
+
+    full_text = "\n".join(text_lines).strip()
+    return full_text, words
 
 
 def _ocr(img: np.ndarray) -> str:

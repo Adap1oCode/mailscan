@@ -51,7 +51,9 @@ def _submit_and_wait(files: dict, data: dict | None = None, timeout: float = 120
 def test_health_no_auth():
     resp = client.get("/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["version"]  # stale-deployment detection relies on this
 
 
 # ---------------------------------------------------------------------------

@@ -31,7 +31,7 @@ import numpy as np
 from PIL import Image
 from pylibdmtx.pylibdmtx import decode as dmtx_decode
 
-from .ai_fallback import ai_extract, ai_summarise
+from .ai_fallback import ai_extract, summarise_letter
 from .pipeline import MatchSettings, _match_clients, default_render_dpi, process_pdf
 
 logger = logging.getLogger("mailscan.batch")
@@ -78,6 +78,14 @@ def _split_thresholds(options: dict | None) -> tuple[float, float]:
     )
 
 
+# Separator crops are normalised to this width before decoding so the decode
+# cost — and therefore the 250ms timeout budget — is independent of render DPI.
+# Regression this fixes: at 300 DPI the centre crop carries 2.25× the pixels of
+# the proven 200 DPI path, the Data Matrix decode blew the timeout, separators
+# went undetected and three letters of a real batch merged into one.
+_SEP_CROP_MAX_W = 700
+
+
 def _is_separator_page(img: np.ndarray, ink_pct: float) -> bool:
     """
     Detect an MVOS-DOC-SEP separator sheet on a rendered grayscale page.
@@ -90,6 +98,11 @@ def _is_separator_page(img: np.ndarray, ink_pct: float) -> bool:
         return False
     h, w = img.shape
     crop = Image.fromarray(img[int(h * 0.28):int(h * 0.62), int(w * 0.30):int(w * 0.70)])
+    if crop.width > _SEP_CROP_MAX_W:
+        crop = crop.resize(
+            (_SEP_CROP_MAX_W, max(1, round(crop.height * _SEP_CROP_MAX_W / crop.width))),
+            Image.BILINEAR,
+        )
     try:
         res = dmtx_decode(crop, timeout=_SEP_DECODE_TIMEOUT_MS, max_count=1)
         return bool(res and SEP_TOKEN in res[0].data.decode("ascii", "ignore"))
@@ -224,6 +237,11 @@ def split_batch(
                 "decision": "review",
                 "tier": None,
                 "summary": None,
+                "summary_error": None,
+                "recipient_company": None,
+                "recipient_individual": None,
+                "recipient_address": None,
+                "recipient_postcode": None,
                 "ocr": [],
             }
         )
@@ -267,6 +285,22 @@ def _enrich_letter(
     settings = MatchSettings(options)
     ctx_base = {"credentials": creds, "options": options or {}}
 
+    # Keep the structured recipient block the AI extracts (company / individual /
+    # address / postcode) — not just the display name. MVOS persists this as the
+    # system-of-record recipient so the inbox shows the AI's clean address, not
+    # sliced OCR. Helper folds an AIResult onto the record.
+    def _capture_recipient(ai_res) -> None:
+        if not ai_res:
+            return
+        if ai_res.company:
+            rec["recipient_company"] = ai_res.company
+        if ai_res.individual_name:
+            rec["recipient_individual"] = ai_res.individual_name
+        if ai_res.address:
+            rec["recipient_address"] = ai_res.address
+        if ai_res.postcode:
+            rec["recipient_postcode"] = ai_res.postcode
+
     # tier up only when the free stack wasn't confident
     if rec["decision"] != "auto":
         if has_textract and carrier_png:
@@ -277,6 +311,7 @@ def _enrich_letter(
             )
             if ai:
                 rec["recipient_name"] = ai.recipient_name or rec["recipient_name"]
+                _capture_recipient(ai)
                 if ai.address:
                     c2, s2, _ = _match_clients(ai.address, client_list, cutoff=settings.cutoff)
                     if c2:
@@ -285,14 +320,19 @@ def _enrich_letter(
             ai3 = ai_extract(b"", {**ctx_base, "ocr_text": combined_text}, prefer="openrouter")
             if ai3 and ai3.recipient_name:
                 rec["recipient_name"] = ai3.recipient_name
+                _capture_recipient(ai3)
                 c3, s3, _ = _match_clients(ai3.recipient_name, client_list, cutoff=settings.cutoff)
                 if c3:
                     rec.update(tier="deepseek", decision="auto", matched_client=c3, match_score=s3)
                 else:
                     rec["tier"] = rec["tier"] or "deepseek-extract"
 
-    # client-facing summary
-    rec["summary"] = ai_summarise(combined_text, ctx_base) if has_openrouter else None
+    # client-facing summary — keep the error reason so the caller can tell a
+    # transient provider failure (retryable) from a genuinely empty summary.
+    if has_openrouter:
+        rec["summary"], rec["summary_error"] = summarise_letter(combined_text, ctx_base)
+    else:
+        rec["summary"], rec["summary_error"] = None, None
 
 
 def process_batch(
@@ -354,6 +394,11 @@ def process_batch(
             "decision": carrier["decision"],
             "tier": "own" if carrier["decision"] == "auto" else None,
             "summary": None,
+            "summary_error": None,
+            "recipient_company": None,
+            "recipient_individual": None,
+            "recipient_address": None,
+            "recipient_postcode": None,
             "ocr": [{"page": n, "text": pages[n]["ocr_text"]} for n in pgs],
         }
         letters.append((rec, combined, carrier))

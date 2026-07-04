@@ -105,6 +105,11 @@ def _opt_int(context: dict | None, section: str, key: str, default: int) -> int:
 DEFAULT_EXTRACT_PROMPT = os.environ.get("MAILSCAN_EXTRACT_PROMPT") or (
     "You identify the DELIVERY RECIPIENT of a UK letter — the person or company "
     "it is physically addressed to, NOT the sender or letterhead organisation. "
+    "The recipient is named in the POSTAL ADDRESS BLOCK (name + street + "
+    "postcode). NEVER use generic heading or salutation words as the name — "
+    "KEEPER, OCCUPIER, OWNER, DIRECTOR, SIR, MADAM identify a role, not the "
+    "recipient; when a heading says e.g. 'NOTICE TO KEEPER', the recipient is "
+    "still the company/person in the address block. "
     "Reply ONLY with JSON (no prose, no markdown): "
     '{"company_name": string|null, '
     '"individual_name": string|null, '
@@ -120,10 +125,31 @@ DEFAULT_EXTRACT_PROMPT = os.environ.get("MAILSCAN_EXTRACT_PROMPT") or (
 DEFAULT_SUMMARY_PROMPT = os.environ.get("MAILSCAN_SUMMARY_PROMPT") or (
     "You summarise a scanned UK letter for the recipient's virtual-mailroom "
     "inbox — so they grasp it without opening the full scan. Return ONLY JSON: "
-    '{"mail_type": string, "sender": string, "summary": string (1-2 plain '
-    'sentences with the key point/action), "action_required": string|null, '
-    '"due_date": string|null, "reference": string|null, "amount": string|null}. '
-    "Be concise and factual; use null when a field is absent."
+    '{"mail_type": string (EXACTLY one of: "official" (government/regulator, '
+    'e.g. Companies House), "tax" (HMRC tax notices/demands), '
+    '"debt_collection" (collection agencies, final demands, arrears), '
+    '"legal" (courts, claims, solicitors), "bank" (bank statements/letters), '
+    '"invoice" (supplier bills), "marketing" (offers/promotions), '
+    '"junk", "business" (anything else)), '
+    '"sender": string, '
+    '"subject": string (one line, like an email subject — the letter\'s own '
+    "subject/heading if it has one, else a short topic phrase), "
+    '"summary": string (1-2 plain sentences with the key point/action), '
+    '"action_required": string|null, '
+    '"due_date": string|null (a DEADLINE stated in the letter — never the '
+    "letter's own date), "
+    '"amount": string|null (the main amount due/owed/balance, copied EXACTLY '
+    "as printed — OCR may insert stray spaces in figures; reconstruct the "
+    "amount carefully), "
+    '"account_number": string|null (the account, agreement, customer or claim '
+    "number this letter is about — the recipient's account with the sender; "
+    "NEVER the sender's own bank/sort-code details for receiving payment, and "
+    "NEVER the print/franking/mailing codes beside the address block), "
+    '"payment_reference": string|null (the exact reference the letter says to '
+    "quote when making a payment), "
+    '"reference": string|null (any other sender reference on the letter)}. '
+    "Fill every field whose value appears ANYWHERE in the letter; use null "
+    "only when genuinely absent. Be concise and factual."
 )
 
 # Default truncation limits for the text handed to the LLM (chars).
@@ -255,6 +281,19 @@ def _openrouter_chat(api_key: str, model: str, system: str, user: str, json_mode
                 logger.warning("openrouter %s: HTTP %s — not retryable", model, e.code)
                 raise
             last_err = e
+            if e.code == 429 and attempt < retries - 1:
+                # Rate limit: the default 1.5–3s backoff doesn't clear a limit
+                # window (observed dropping one letter per real batch run).
+                # Honour Retry-After when present, else back off harder.
+                retry_after = 0.0
+                try:
+                    retry_after = float(e.headers.get("Retry-After") or 0)
+                except (TypeError, ValueError):
+                    pass
+                wait = min(max(retry_after, 5.0 * (attempt + 1)), 30.0)
+                logger.warning("openrouter %s rate-limited — waiting %.0fs", model, wait)
+                time.sleep(wait)
+                continue
         except Exception as e:  # transient HTTP / network / parse — retry
             last_err = e
         logger.warning(
@@ -336,23 +375,47 @@ class OpenRouterProvider(AIProvider):
         )
 
 
-def ai_summarise(text: str, context: dict | None = None) -> Optional[dict]:
+def summarise_letter(
+    text: str, context: dict | None = None
+) -> tuple[Optional[dict], Optional[str]]:
     """
-    Client-facing summary of a letter (Hoxton-style) via OpenRouter. Returns a dict
-    of structured fields, or None if unavailable. Never raises.
+    Client-facing summary of a letter via OpenRouter. Returns (summary, error):
+
+      (dict, None)  — success.
+      (None, None)  — NOT attempted: no summary provider configured, or no text.
+                      This is a legitimate empty, not a failure.
+      (None, str)   — the provider ERRORED after its retries. The string is a
+                      short machine reason (e.g. "HTTPError: 429") so the caller
+                      can tell a TRANSIENT failure worth retrying apart from a
+                      genuinely-empty summary. Never raises.
+
+    This distinction is the contract that lets the mailroom brain (MVOS) retry
+    only the letters that actually failed extraction, instead of guessing from a
+    bare `null` why a letter has no sender/subject.
     """
     context = context or {}
     api_key, model = _openrouter_model(context, task="summary")
     if not api_key or not (text or "").strip():
-        return None
+        return None, None
     prompt = _opt_str(context, "prompts", "summary") or DEFAULT_SUMMARY_PROMPT
     limit = _opt_int(context, "limits", "summary_chars", _SUMMARY_CHARS)
     try:
         out = _openrouter_chat(api_key, model, prompt, (text or "")[:limit])
-        return _loose_json(out) or {"mail_type": "Letter", "summary": out[:400]}
-    except Exception:
-        logger.warning("ai_summarise failed — letter will have no summary", exc_info=True)
-        return None
+        return (_loose_json(out) or {"mail_type": "Letter", "summary": out[:400]}), None
+    except Exception as e:
+        # _openrouter_chat has already exhausted its retries/backoff — this is a
+        # real failure, not a hiccup. Surface WHY instead of swallowing it.
+        logger.warning("summarise_letter failed — letter will have no summary", exc_info=True)
+        return None, f"{type(e).__name__}: {e}"[:300]
+
+
+def ai_summarise(text: str, context: dict | None = None) -> Optional[dict]:
+    """
+    Back-compat shim — the summary dict only (None when absent OR errored).
+    Prefer summarise_letter() when you need to know WHY a summary is missing.
+    """
+    summary, _error = summarise_letter(text, context)
+    return summary
 
 
 class GeminiProvider(AIProvider):

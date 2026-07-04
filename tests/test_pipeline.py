@@ -218,6 +218,51 @@ def test_options_override_prompts_models_limits():
     assert _opt_int({"options": {"limits": {"extract_chars": "junk"}}}, "limits", "extract_chars", 6000) == 6000
 
 
+# --- summarise_letter: distinguish provider failure from an empty summary -----
+
+_SUMMARY_CTX = {"credentials": {"openrouter": {"api_key": "k", "model": "m"}}}
+
+
+def test_summarise_letter_not_attempted_without_key():
+    from app.ai_fallback import summarise_letter
+
+    # No provider configured → (None, None): a legitimate empty, not a failure.
+    summary, error = summarise_letter("Some letter text", {"credentials": {}})
+    assert summary is None and error is None
+
+
+def test_summarise_letter_success(monkeypatch):
+    import app.ai_fallback as af
+
+    monkeypatch.setattr(
+        af, "_openrouter_chat", lambda *a, **k: '{"sender": "HMRC", "summary": "Pay up"}'
+    )
+    summary, error = af.summarise_letter("letter text", _SUMMARY_CTX)
+    assert error is None
+    assert summary and summary["sender"] == "HMRC"
+
+
+def test_summarise_letter_reports_provider_error(monkeypatch):
+    import app.ai_fallback as af
+
+    def _boom(*a, **k):
+        raise RuntimeError("openrouter down")
+
+    monkeypatch.setattr(af, "_openrouter_chat", _boom)
+    summary, error = af.summarise_letter("letter text", _SUMMARY_CTX)
+    # The whole point: a provider failure is NOT a silent empty — it's reported.
+    assert summary is None
+    assert error is not None and "RuntimeError" in error
+
+
+def test_ai_summarise_shim_returns_dict_only(monkeypatch):
+    import app.ai_fallback as af
+
+    monkeypatch.setattr(af, "_openrouter_chat", lambda *a, **k: '{"summary": "ok"}')
+    result = af.ai_summarise("letter text", _SUMMARY_CTX)
+    assert isinstance(result, dict) and result["summary"] == "ok"
+
+
 def test_options_override_match_cutoff():
     from app.pipeline import process_pdf
 

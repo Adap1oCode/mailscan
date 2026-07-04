@@ -25,9 +25,11 @@ from .pipeline import default_render_dpi, pdf_page_count, process_pdf
 
 logger = logging.getLogger("mailscan.api")
 
+APP_VERSION = "2.2.0"  # + summary_error: distinguish provider failure from empty summary
+
 app = FastAPI(
     title="Mailscan",
-    version="2.0.0",
+    version=APP_VERSION,
     description="PDF mail scan → OCR + barcode + client matching",
 )
 
@@ -205,7 +207,9 @@ def _get_celery() -> Any | None:
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    # version lets callers detect a stale deployment (e.g. one without the
+    # /split endpoint or the v2 summary contract) instead of guessing from 404s.
+    return {"status": "ok", "version": APP_VERSION}
 
 
 @app.post("/process")
@@ -372,13 +376,18 @@ async def ai_letter(
     Used for per-letter AI re-runs without re-processing the whole batch.
 
     Returns:
-      { recipient_name: str|null, summary: {mail_type, sender, summary, action_required}|null }
+      { recipient_name: str|null,
+        summary: {mail_type, sender, subject, summary, action_required,
+                  due_date, reference, amount, account_number,
+                  payment_reference}|null,
+        summary_error: str|null }   # set when the provider errored (retryable),
+                                     # null when the summary is genuinely empty
     """
     creds = parse_credentials(ai_credentials) or {}
     opts = parse_json_object(options, "options") or {}
     prefer = ai_prefer.strip() or "openrouter"
 
-    from .ai_fallback import ai_extract, ai_summarise
+    from .ai_fallback import ai_extract, summarise_letter
 
     ctx = {"ocr_text": ocr_text, "credentials": creds, "options": opts}
 
@@ -389,8 +398,11 @@ async def ai_letter(
         extraction = await run_in_threadpool(ai_extract, b"", ctx, prefer=prefer)
 
     summary_obj = None
+    summary_error = None
     if creds.get("openrouter"):
-        summary_obj = await run_in_threadpool(ai_summarise, ocr_text, ctx)
+        summary_obj, summary_error = await run_in_threadpool(
+            summarise_letter, ocr_text, ctx
+        )
 
     return {
         "recipient_name": extraction.recipient_name if extraction else None,
@@ -401,9 +413,16 @@ async def ai_letter(
         "summary": {
             "mail_type": summary_obj.get("mail_type"),
             "sender": summary_obj.get("sender"),
+            "subject": summary_obj.get("subject"),
             "summary": summary_obj.get("summary"),
             "action_required": summary_obj.get("action_required"),
+            "due_date": summary_obj.get("due_date"),
+            "reference": summary_obj.get("reference"),
+            "amount": summary_obj.get("amount"),
+            "account_number": summary_obj.get("account_number"),
+            "payment_reference": summary_obj.get("payment_reference"),
         } if summary_obj else None,
+        "summary_error": summary_error,
     }
 
 
